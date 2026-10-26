@@ -1,0 +1,10 @@
+{
+  "name": "claudevoice",
+  "version": "0.2.0",
+  "description": "Voice for Claude Code: read replies aloud with Kokoro and hold spoken calls, with local or cloud speech engines",
+  "author": { "name": "SinaJaf" },
+  "homepage": "https://github.com/SinaJaf/claudevoice",
+  "license": "MIT",
+  "keywords": ["voice", "tts", "speech", "kokoro", "whisper"],
+  "types": "./types/index.d.ts"
+}

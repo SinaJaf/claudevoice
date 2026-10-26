@@ -1,0 +1,11 @@
+{
+  "name": "claudevoice",
+  "owner": { "name": "SinaJaf" },
+  "plugins": [
+    {
+      "name": "claudevoice",
+      "source": "./",
+      "description": "Voice for Claude Code: read replies aloud with Kokoro and hold spoken calls, with local or cloud speech engines"
+    }
+  ]
+}
