@@ -1,26 +1,25 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ChatSettings, ListenMode, VoicePhase, VoiceSettings } from '../types'
+import type { ChatSettings, VoicePhase, VoiceSettings } from '../types'
 
 const SERVER = 'http://127.0.0.1:8765'
 
 const PANE = 'claudevoice'
 const SETTINGS_PANE = 'claudevoice-settings'
-const MODE_STORE_KEY = 'listenMode'
 
 const phase = atom({ plugin: 'claudevoice', key: 'phase' } as const, 'idle' as VoicePhase)
 const isCall = atom({ plugin: 'claudevoice', key: 'isCall' } as const, false)
 const heard = atom({ plugin: 'claudevoice', key: 'heard' } as const, '')
 const note = atom({ plugin: 'claudevoice', key: 'note' } as const, '')
-const mode = atom({ plugin: 'claudevoice', key: 'mode' } as const, 'hold' as ListenMode)
 const settings = atom({ plugin: 'claudevoice', key: 'settings' } as const, {} as VoiceSettings)
 const enabled = atom({ plugin: 'claudevoice', key: 'enabled' } as const, true)
-const muted = atom({ plugin: 'claudevoice', key: 'muted' } as const, false)
 /** This chat's own settings: a key here overrides the all-chats setting (see ChatSettings). */
 const chat = atom({ plugin: 'claudevoice', key: 'chat' } as const, {} as ChatSettings)
 /** Which settings rows have their "this chat" dropdown open. */
 const chatOpen = atom({ plugin: 'claudevoice', key: 'chatOpen' } as const, {} as Record<string, boolean>)
+/** Animation frame counter for the footer's live status. */
+const tick = atom({ plugin: 'claudevoice', key: 'tick' } as const, 0)
 const CHAT_STORE_PREFIX = 'chat:'
 const SAME_AS_ALL = '__all__'
 const ENABLED_STORE_KEY = 'enabled'
@@ -124,24 +123,6 @@ async function isEnabled($: Engine): Promise<boolean> {
   return c.plugin !== undefined ? c.plugin === 'on' : read($, enabled)
 }
 
-async function listenModeHere($: Engine): Promise<ListenMode> {
-  const c = await read($, chat)
-  const m = c.listenMode ?? (await read($, mode))
-  return m === 'auto' ? 'auto' : 'hold'
-}
-
-/** Listener flags for this chat's listening engine and microphone, if it has its own. */
-async function listenOverrides($: Engine): Promise<string[]> {
-  const c = await read($, chat)
-  const args: string[] = []
-  if (c.listening !== undefined) {
-    const [engine, model] = c.listening.split(':', 2) as [string, string]
-    args.push(`--stt=${engine}`, engine === 'local' ? `--whisper=${model}` : `--stt-model=${model}`)
-  }
-  if (c.microphone !== undefined) args.push(`--device=${c.microphone}`)
-  return args
-}
-
 async function setChatSetting($: Engine, key: keyof ChatSettings, value: string): Promise<void> {
   const next: ChatSettings = { ...(await read($, chat)) }
   if (value === SAME_AS_ALL) delete next[key]
@@ -184,15 +165,36 @@ async function stopSpeaking($: Engine): Promise<void> {
   }
 }
 
-async function touch($: Engine, path: string): Promise<void> {
-  try {
-    await $.fs.write(path, '')
-  } catch {
-    // the listener then stops on its own at its cap
-  }
-}
 
 // ---- the features -----------------------------------------------------------------
+// You talk with Claude's own microphone (its dictation fills the prompt box); this
+// plugin sends what is there when you press Done and speaks every reply back.
+
+async function setPhase($: Engine, p: VoicePhase): Promise<void> {
+  await update($, phase, () => p)
+  if (p !== 'idle') startTicker($)
+}
+
+let ticking = false
+
+/** Advance the footer's animation while something is happening; stops when idle. */
+function startTicker($: Engine): void {
+  if (ticking) return
+  ticking = true
+  const step = (): void => {
+    $.clock.after(250, () => {
+      void (async () => {
+        if ((await read($, phase)) === 'idle') {
+          ticking = false
+          return
+        }
+        await update($, tick, t => (t + 1) % 1000)
+        step()
+      })()
+    })
+  }
+  step()
+}
 
 /** Read the last reply in this session aloud, once. */
 async function readAloud($: Engine): Promise<void> {
@@ -203,14 +205,15 @@ async function readAloud($: Engine): Promise<void> {
     return
   }
   if (!(await speak($, last.text))) return
-  await update($, phase, () => 'speaking')
+  await setPhase($, 'speaking')
   watchPlayback($)
 }
 
-/** Poll the server until playback ends, then go idle or, in a call, listen again. */
+/** Poll the server until playback ends; in a call it is then your turn. */
 function watchPlayback($: Engine): void {
   $.clock.after(300, () => {
     void (async () => {
+      if ((await read($, phase)) !== 'speaking') return // stopped, or a new turn began
       const h = await health($)
       if (h?.speaking) {
         watchPlayback($)
@@ -220,178 +223,59 @@ function watchPlayback($: Engine): void {
         await update($, note, () => h.last_error ?? '')
         $.ui.toast(h.last_error)
       }
-      if (await read($, isCall)) {
-        void listenOnce($)
-      } else {
-        await update($, phase, () => 'idle')
-      }
+      await setPhase($, (await read($, isCall)) ? 'listening' : 'idle')
     })()
   })
-}
-
-/** Record one utterance (until a pause, or until Done in hold mode), transcribe, send. */
-async function listenOnce($: Engine): Promise<void> {
-  if (!(await read($, isCall))) return
-  await update($, phase, () => 'listening') // while muted the listener records nothing
-  // The listener runs detached and leaves its answer in a file of its own, so a
-  // hold-mode take lasts until Done, beyond the 10-minute limit on a plugin command.
-  const session = (await $.session.id()).replace(/[^A-Za-z0-9_-]/g, '')
-  const resultPath = await flagPath($, `listen-${session}-${await $.clock.now()}.json`)
-  const argv = [...(await python($)), '-m', 'claudevoice.listen', ...(await listenOverrides($))]
-  if ((await listenModeHere($)) === 'hold') argv.push('--manual')
-  argv.push('--result', resultPath, '--detach')
-  const ran = await $.process.run(argv, { cwd: root($), timeoutMs: 60000 })
-  if (ran.exitCode !== 0) {
-    await endCall($, `listening failed: ${ran.stderr.trim().split('\n').pop() ?? 'unknown error'}`)
-    return
-  }
-  awaitTake($, resultPath)
-}
-
-/** Check for the listener's answer every 300 ms, then act on it. */
-function awaitTake($: Engine, resultPath: string): void {
-  $.clock.after(300, () => {
-    void (async () => {
-      if (!(await read($, isCall))) return // hung up: the listener was told to stop
-      let raw = ''
-      try {
-        if (await $.fs.exists(resultPath)) raw = String(await $.fs.read(resultPath))
-      } catch {
-        raw = ''
-      }
-      if (raw === '') {
-        awaitTake($, resultPath)
-        return
-      }
-      await handleTake($, raw)
-    })()
-  })
-}
-
-async function handleTake($: Engine, raw: string): Promise<void> {
-  if (!(await read($, isCall))) return
-  let text = ''
-  let cancelled = false
-  let silent = false
-  let busy = false
-  let device = ''
-  let error = ''
-  try {
-    const parsed = JSON.parse(raw.trim()) as {
-      text?: string; cancelled?: boolean; silent?: boolean; busy?: boolean; device?: string; error?: string
-    }
-    error = parsed.error ?? ''
-    text = (parsed.text ?? '').trim()
-    cancelled = parsed.cancelled === true
-    silent = parsed.silent === true
-    busy = parsed.busy === true
-    device = parsed.device ?? ''
-  } catch {
-    text = ''
-  }
-  // Another listener already has the microphone and will send what was said.
-  if (cancelled || busy) return
-  if (error !== '') {
-    await endCall($, `listening failed: ${error}`)
-    $.ui.toast(`listening failed: ${error}`)
-    return
-  }
-  if (silent) {
-    // The input carried no signal at all: unplugged, lid closed, or no permission.
-    const why = `The microphone "${device}" is giving silence. Check it is connected and allowed, or pick another one in the voice settings.`
-    await endCall($, why)
-    $.ui.toast(why)
-    if (await speak($, 'I cannot hear anything from the microphone. Please check it, or choose another one in the voice settings.')) {
-      await update($, phase, () => 'speaking')
-      watchPlayback($)
-    }
-    return
-  }
-  if (text === '') {
-    if ((await listenModeHere($)) === 'hold') $.ui.toast("I didn't catch any words; still listening")
-    void listenOnce($) // silence or noise: keep listening
-    return
-  }
-  await update($, heard, () => text)
-  await update($, phase, () => 'thinking')
-  await $.prompt.submit({ text })
 }
 
 async function startCall($: Engine): Promise<void> {
   if (await read($, isCall)) return
   await update($, isCall, () => true)
-  await update($, muted, () => false)
-  await setMuteFlag($, false)
   await update($, note, () => '')
-  await update($, phase, () => 'loading')
+  await setPhase($, 'loading')
   if (!(await ensureServer($))) {
     await endCall($, '')
     return
   }
-  const warm = await $.process.run([...(await python($)), '-m', 'claudevoice.listen', ...(await listenOverrides($)), '--warm'], { cwd: root($), timeoutMs: 600000 })
-  if (warm.exitCode !== 0) {
-    await endCall($, `could not load Whisper: ${warm.stderr.trim().split('\n').pop() ?? ''}`)
-    return
+  if (await speak($, "I'm here. Talk with the mic, take your time, and press Done when you've finished.")) {
+    await setPhase($, 'speaking')
+    watchPlayback($)
+  } else {
+    await setPhase($, 'listening')
   }
-  const greeting = (await listenModeHere($)) === 'hold'
-    ? "I'm listening. Take your time, and press Done when you've finished."
-    : "I'm listening."
-  await speak($, greeting)
-  await update($, phase, () => 'speaking')
-  watchPlayback($)
 }
 
+/** Hang up: stop the voice. Never touches the work Claude is doing. */
 async function endCall($: Engine, reason: string): Promise<void> {
   await update($, isCall, () => false)
-  await update($, muted, () => false)
-  await setMuteFlag($, false)
-  await update($, phase, () => 'idle')
+  await setPhase($, 'idle')
   await update($, note, () => reason)
-  await touch($, await flagPath($, 'listen.stop'))
   await stopSpeaking($)
 }
 
-/** Mute pauses the microphone: nothing is recorded while muted, but what you said
- *  before muting is kept, and Done still sends it. Unmute carries on the same take. */
-async function toggleMute($: Engine): Promise<void> {
-  const next = !(await read($, muted))
-  await update($, muted, () => next)
-  await setMuteFlag($, next)
-}
-
-async function setMuteFlag($: Engine, on: boolean): Promise<void> {
-  try {
-    await $.fs.write(await flagPath($, 'listen.mute'), on ? '1' : '0')
-  } catch {
-    // no flag: the listener records as usual
+/** Send what your dictation (or typing) left in the prompt box. */
+async function done($: Engine): Promise<void> {
+  const { text } = await $.prompt.read()
+  const said = text.trim()
+  if (said === '') {
+    $.ui.toast('Nothing in the prompt box yet: talk with the mic first')
+    return
   }
+  if ((await read($, phase)) === 'speaking') await stopSpeaking($)
+  await $.prompt.fill({ text: '' })
+  await update($, heard, () => said)
+  await setPhase($, 'thinking')
+  await $.prompt.submit({ text: said })
 }
 
-/** Hold mode: finish the recording and send it. */
-async function doneTalking($: Engine): Promise<void> {
-  if ((await read($, phase)) === 'listening') await touch($, await flagPath($, 'listen.done'))
-}
-
-/** Cut Claude off and start listening right away. */
-async function talkNow($: Engine): Promise<void> {
-  if ((await read($, phase)) === 'speaking') await stopSpeaking($) // watchPlayback then listens
-}
-
-async function toggleMode($: Engine): Promise<void> {
-  const next: ListenMode = (await read($, mode)) === 'hold' ? 'auto' : 'hold'
-  await update($, mode, () => next)
-  await $.store.set(MODE_STORE_KEY, next)
-  $.ui.toast(next === 'hold' ? 'Hold mode: press Done when you have finished talking' : 'Auto mode: a pause sends what you said')
+/** Stop Claude's voice; in a call it is your turn right away. */
+async function stop($: Engine): Promise<void> {
+  await stopSpeaking($)
+  if ((await read($, phase)) === 'speaking') await setPhase($, (await read($, isCall)) ? 'listening' : 'idle')
 }
 
 // ---- settings ----------------------------------------------------------------------
 
-const WHISPER_MODELS: readonly [string, string][] = [
-  ['small', 'Whisper small (fast)'],
-  ['medium', 'Whisper medium'],
-  ['large-v3-turbo', 'Whisper large v3 turbo (default)'],
-  ['large-v3', 'Whisper large v3 (most accurate)'],
-]
 const KOKORO_VOICES: readonly [string, string][] = [
   ['af_heart', 'Heart (US, warm)'], ['af_bella', 'Bella (US)'], ['af_nicole', 'Nicole (US, soft)'],
   ['am_michael', 'Michael (US)'], ['am_fenrir', 'Fenrir (US)'],
@@ -399,11 +283,6 @@ const KOKORO_VOICES: readonly [string, string][] = [
 ]
 const OPENAI_VOICES = ['alloy', 'ash', 'coral', 'echo', 'nova', 'onyx', 'sage', 'shimmer'] as const
 const SPEEDS = ['0.9', '1.0', '1.05', '1.15', '1.25'] as const
-
-/** "mlx-community/whisper-large-v3-mlx" -> "large-v3", so old configs still match an option. */
-function shortWhisper(name: string): string {
-  return name.replace(/^.*\/whisper-/, '').replace(/-mlx$/, '')
-}
 
 async function loadSettings($: Engine): Promise<VoiceSettings> {
   const py = await python($)
@@ -416,14 +295,6 @@ async function loadSettings($: Engine): Promise<VoiceSettings> {
   }
   const flat: VoiceSettings = {}
   for (const [k, v] of Object.entries(parsed)) flat[k] = String(v)
-  // The microphones on this machine, newline-separated; the default one first.
-  const mics = await $.process.run([...py, '-m', 'claudevoice.listen', '--devices'], { cwd: root($), timeoutMs: 60000 })
-  try {
-    const list = JSON.parse(mics.stdout.trim().split('\n').pop() ?? '[]') as { name: string; default: boolean }[]
-    flat._microphones = list.map(d => (d.default ? `${d.name}\t(system default)` : d.name)).join('\n')
-  } catch {
-    flat._microphones = ''
-  }
   await update($, settings, () => flat)
   return flat
 }
@@ -436,17 +307,7 @@ async function setSetting($: Engine, key: string, value: string): Promise<void> 
 
 async function openSettings($: Engine): Promise<void> {
   await loadSettings($)
-  await $.ui.open({ id: SETTINGS_PANE, title: 'Voice settings', focus: true, closeOnEscape: true, rows: 34 })
-}
-
-/** "local:<whisper repo>" or "openai:<model>" from the config, and back. */
-function listeningValue(s: VoiceSettings): string {
-  return s.stt_engine === 'openai' ? `openai:${s.stt_model ?? ''}` : `local:${shortWhisper(s.whisper_model ?? '')}`
-}
-async function pickListening($: Engine, value: string): Promise<void> {
-  const [engine, model] = value.split(':', 2) as ['local' | 'openai', string]
-  await setSetting($, 'stt_engine', engine)
-  await setSetting($, engine === 'local' ? 'whisper_model' : 'stt_model', model)
+  await $.ui.open({ id: SETTINGS_PANE, title: 'Voice settings', focus: true, closeOnEscape: true, rows: 22 })
 }
 
 function speakingValue(s: VoiceSettings): string {
@@ -470,65 +331,59 @@ async function setEnabled($: Engine, on: boolean): Promise<void> {
 async function quiet($: Engine): Promise<void> {
   if (await read($, isCall)) await endCall($, '')
   else await stopSpeaking($)
-  await update($, phase, () => 'idle')
+  await setPhase($, 'idle')
 }
 
 // ---- drawing -------------------------------------------------------------------------
 
 type Surface = Parameters<Engine['ui']['resolve']>[0]
 
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
+const WAVE = ['▁▃▅▃', '▃▅▇▅', '▅▇▅▃', '▇▅▃▁', '▅▃▁▃', '▃▁▃▅'] as const
+
+/** The live status: what is happening now, animated. */
+async function liveStatus($: Engine, e: Surface) {
+  const { Box, Text } = $.ui.resolve(e)
+  const current = await read($, phase)
+  const t = await read($, tick)
+  if (current === 'idle') return null
+  const glyph = (text: string, color: string) => <Text key="glyph" color={color}>{text}</Text>
+  const parts = {
+    loading: [glyph(SPINNER[t % SPINNER.length] ?? '', 'claude'), 'starting the voice'],
+    listening: [glyph(t % 4 < 2 ? '●' : '○', 'success'), 'your turn · talk with the mic, then Done'],
+    thinking: [glyph(SPINNER[t % SPINNER.length] ?? '', 'claude'), 'thinking'],
+    speaking: [glyph(WAVE[t % WAVE.length] ?? '', 'claude'), 'speaking'],
+  }[current]
+  return (
+    <Box>
+      {parts[0]}
+      <Text dimColor> {parts[1]}</Text>
+    </Box>
+  )
+}
+
 /** One compact row of controls, drawn in the band above the prompt and in the pane. */
 async function controls($: Engine, e: Surface, compact: boolean) {
   const { Box, Button, Text } = $.ui.resolve(e)
   const current = await read($, phase)
   const inCall = await read($, isCall)
-  const listenMode = await listenModeHere($)
   const lastHeard = await read($, heard)
   const message = await read($, note)
-  const isMuted = await read($, muted)
   await read($, chat) // redraw when this chat's settings change
-
-  const status: Record<VoicePhase, string> = {
-    idle: inCall ? (isMuted ? 'mic muted' : 'on a call') : '',
-    loading: 'loading voice…',
-    listening: isMuted ? 'mic muted · Done sends what you said before muting' : listenMode === 'hold' ? '● listening, press Done when finished' : '● listening, pause to send',
-    thinking: 'thinking…',
-    speaking: '♪ speaking',
-  }
 
   return (
     <Box flexDirection="column">
       <Box>
-        {status[current] !== '' && <Text dimColor>{status[current]}</Text>}
+        {await liveStatus($, e)}
         <Box flexGrow={1} />
         {!inCall && <Button key="read" label="Read aloud" hotkey="r" plain onPress={() => void readAloud($)} />}
         {!inCall && <Text> </Text>}
-        {(current === 'speaking' || (inCall && current !== 'listening')) && (
-          <Button key="stop" label="Stop" hotkey="s" plain onPress={() => void stopSpeaking($)} />
-        )}
-        {(current === 'speaking' || (inCall && current !== 'listening')) && <Text> </Text>}
-        <Button
-          key="mode"
-          label={listenMode === 'hold' ? 'mode: hold' : 'mode: auto'}
-          hotkey="m"
-          plain
-          dimColor
-          onPress={() => void toggleMode($)}
-        />
-        <Text> </Text>
+        {inCall && <Button key="done" label="Done" hotkey="d" variant="primary" onPress={() => void done($)} />}
+        {inCall && <Text> </Text>}
+        {(inCall || current === 'speaking') && <Button key="stop" label="Stop" hotkey="s" plain onPress={() => void stop($)} />}
+        {(inCall || current === 'speaking') && <Text> </Text>}
         <Button key="settings" label="⚙" hotkey="g" plain onPress={() => void openSettings($)} />
         <Text> </Text>
-        {inCall && current === 'listening' && (listenMode === 'hold' || isMuted) && (
-          <Button key="done" label="Done" hotkey="d" variant="primary" onPress={() => void doneTalking($)} />
-        )}
-        {inCall && current === 'speaking' && (
-          <Button key="talk" label="Talk now" hotkey="t" variant="primary" onPress={() => void talkNow($)} />
-        )}
-        {inCall && (current === 'listening' || current === 'speaking') && <Text> </Text>}
-        {inCall && (
-          <Button key="mute" label={isMuted ? 'Unmute mic' : 'Mute mic'} hotkey="u" plain onPress={() => void toggleMute($)} />
-        )}
-        {inCall && <Text> </Text>}
         {inCall ? (
           <Button key="end" label="End call" hotkey="e" onPress={() => void endCall($, '')} />
         ) : (
@@ -541,66 +396,66 @@ async function controls($: Engine, e: Surface, compact: boolean) {
   )
 }
 
-/** The controls drawn inside the prompt footer, where the dim mode labels sit (under the mic).
- *  Styled like the footer's own items: no chrome, dim, brighter on hover, no hotkey chips. */
+/** The controls drawn inside the prompt footer, under the mic. In a call the same
+ *  controls always stand in the same places; the one that matters now lights up. */
 async function footer($: Engine, e: Surface, modes: readonly string[]) {
   const { Box, Button, Text } = $.ui.resolve(e)
   const isOn = await isEnabled($)
   const current = await read($, phase)
   const inCall = await read($, isCall)
-  const listenMode = await listenModeHere($)
-  const isMuted = await read($, muted)
   const quiet = { dimColor: true, hover: { dimColor: false, scope: 'voice' } } as const
+  const lit = { hover: { bold: true, scope: 'voice' } } as const
   const gear = <Button key="settings" label="⚙" plain {...quiet} onPress={() => void openSettings($)} />
   const sep = <Text dimColor> · </Text>
+  const modeLabel = modes.length > 0 ? <Text dimColor>{modes.join(' & ')}</Text> : null
 
   if (!isOn) {
     return (
       <Box>
-        {modes.length > 0 && <Text dimColor>{modes.join(' & ')}</Text>}
-        {modes.length > 0 && sep}
+        {modeLabel}
+        {modeLabel && sep}
         {gear}
       </Box>
     )
   }
 
-  const status: Record<VoicePhase, string> = {
-    idle: inCall && isMuted ? 'mic muted' : '',
-    loading: 'loading voice…',
-    listening: isMuted ? 'mic muted · Done sends what you said before muting' : listenMode === 'hold' ? '● listening · press Done when finished' : '● listening · pause to send',
-    thinking: 'thinking…',
-    speaking: '♪ speaking',
-  }
-  const busy = current === 'speaking' || (inCall && current !== 'listening')
-
+  const status = await liveStatus($, e)
+  const yourTurn = current === 'listening'
+  const speaking = current === 'speaking'
   return (
     <Box>
-      {modes.length > 0 && <Text dimColor>{modes.join(' & ')}</Text>}
-      {modes.length > 0 && sep}
-      {status[current] !== '' && <Text dimColor>{status[current]}</Text>}
-      {status[current] !== '' && sep}
+      {modeLabel}
+      {modeLabel && sep}
+      {status}
+      {status && sep}
       {!inCall && <Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />}
       {!inCall && sep}
-      {busy && <Button key="stop" label="Stop" plain {...quiet} onPress={() => void stopSpeaking($)} />}
-      {busy && sep}
+      {inCall && (
+        <Box key="done-box">
+          <Text color={yourTurn ? 'success' : undefined} dimColor={!yourTurn}>✓ </Text>
+          <Button key="done" label="Done" plain dimColor={!yourTurn} {...(yourTurn ? lit : { hover: quiet.hover })} onPress={() => void done($)} />
+        </Box>
+      )}
+      {inCall && sep}
+      {(inCall || speaking) && (
+        <Box key="stop-box">
+          <Text dimColor={!speaking}>■ </Text>
+          <Button key="stop" label="Stop" plain dimColor={!speaking} {...(speaking ? lit : { hover: quiet.hover })} onPress={() => void stop($)} />
+        </Box>
+      )}
+      {(inCall || speaking) && sep}
       {gear}
       {sep}
-      {inCall && current === 'listening' && (listenMode === 'hold' || isMuted) && (
-        <Button key="done" label="Done" plain hover={{ bold: true, scope: 'voice' }} onPress={() => void doneTalking($)} />
-      )}
-      {inCall && current === 'speaking' && (
-        <Button key="talk" label="Talk now" plain hover={{ bold: true, scope: 'voice' }} onPress={() => void talkNow($)} />
-      )}
-      {inCall && (current === 'listening' || current === 'speaking') && sep}
-      {inCall && isMuted && (
-        <Button key="mute" label="Unmute mic" plain hover={{ bold: true, scope: 'voice' }} onPress={() => void toggleMute($)} />
-      )}
-      {inCall && !isMuted && <Button key="mute" label="Mute mic" plain {...quiet} onPress={() => void toggleMute($)} />}
-      {inCall && sep}
       {inCall ? (
-        <Button key="end" label="End call" plain hover={{ bold: true, scope: 'voice' }} onPress={() => void endCall($, '')} />
+        <Box key="end-box">
+          <Text color="error">✕ </Text>
+          <Button key="end" label="End call" plain {...lit} onPress={() => void endCall($, '')} />
+        </Box>
       ) : (
-        <Button key="call" label="● Call" plain hover={{ bold: true, scope: 'voice' }} onPress={() => void startCall($)} />
+        <Box key="call-box">
+          <Text color="claude">● </Text>
+          <Button key="call" label="Call" plain {...lit} onPress={() => void startCall($)} />
+        </Box>
       )}
     </Box>
   )
@@ -614,7 +469,6 @@ async function settingsPane($: Engine, e: Surface) {
   }
   const { Box, Button, Select, Text } = $.ui.resolve(e)
   const s = await read($, settings)
-  const listenMode = await read($, mode)
   const here = await read($, chat)
   const open = await read($, chatOpen)
   const isOn = await read($, enabled)
@@ -624,29 +478,12 @@ async function settingsPane($: Engine, e: Surface) {
     { value: 'on', label: 'On: voice controls in the prompt footer' },
     { value: 'off', label: 'Off: only the gear stays, to turn it back on' },
   ]
-  const listening: Option[] = [
-    ...WHISPER_MODELS.map(([repo, label]) => ({ value: `local:${repo}`, label: `Local: ${label}` })),
-    { value: 'openai:gpt-4o-mini-transcribe', label: 'Cloud: OpenAI gpt-4o-mini-transcribe' },
-    { value: 'openai:gpt-4o-transcribe', label: 'Cloud: OpenAI gpt-4o-transcribe' },
-  ]
-  const microphones: Option[] = [
-    { value: '', label: 'System default (follows your system)' },
-    ...(s._microphones ?? '').split('\n').filter(x => x !== '').map(line => {
-      const [name, tag] = line.split('\t') as [string, string | undefined]
-      return { value: name, label: tag ? `${name} ${tag}` : name }
-    }),
-  ]
   const speaking: Option[] = [
     ...KOKORO_VOICES.map(([v, label]) => ({ value: `kokoro:${v}`, label: `Local Kokoro: ${label}` })),
     ...OPENAI_VOICES.map(v => ({ value: `openai:${v}`, label: `Cloud OpenAI: ${v}` })),
     { value: 'elevenlabs:', label: `Cloud ElevenLabs: voice ${s.tts_voice ?? ''}` },
   ]
   const speeds: Option[] = SPEEDS.map(x => ({ value: x, label: x === '1.0' ? '1.0 (natural)' : x }))
-  const modes: Option[] = [
-    { value: 'hold', label: 'Hold: I pause as much as I like, then press Done' },
-    { value: 'auto', label: 'Auto: a one-second pause sends what I said' },
-  ]
-
   /** One setting: its title with a "this chat" dropdown, the all-chats choice,
    *  and, when the dropdown is open, the same choice for this chat only. */
   const row = (
@@ -692,17 +529,11 @@ async function settingsPane($: Engine, e: Surface) {
       <Text dimColor>Each choice applies to all chats. Open "this chat" under a setting to change it for this chat only.</Text>
       <Box marginTop={1} flexDirection="column">
         {row('plugin', 'Voice plugin', plugin, isOn ? 'on' : 'off', (v: string) => void setEnabled($, v === 'on'), true)}
-        {row('listening', 'Listening (speech to text)', listening, listeningValue(s), (v: string) => void pickListening($, v))}
-        {row('microphone', 'Microphone', microphones, s.input_device ?? '', (v: string) => void setSetting($, 'input_device', v))}
         {row('speaking', 'Speaking (text to speech)', speaking, speakingValue(s), (v: string) => void pickSpeaking($, v))}
         {row('speed', 'Speed', speeds, String(Number(s.speed ?? '1.05')), (v: string) => void setSetting($, 'speed', v))}
-        {row('listenMode', 'When you talk', modes, listenMode, (v: string) => void (async () => {
-          await update($, mode, () => (v === 'auto' ? 'auto' : 'hold'))
-          await $.store.set(MODE_STORE_KEY, v)
-        })())}
       </Box>
       <Box marginTop={1}>
-        <Text dimColor>Cloud engines read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>
+        <Text dimColor>You talk with Claude's own microphone. Cloud voices read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>
       </Box>
       <Box marginTop={1}>
         <Button key="close" label="Close" role="dismiss" onPress={() => void $.ui.close({ id: SETTINGS_PANE })} />
@@ -718,8 +549,6 @@ export const register: Register = on => {
     await $.command.register({ name: 'voice-panel', description: 'Open the voice pane (read aloud, call)' })
     await update($, isCall, () => false)
     await update($, phase, () => 'idle')
-    const saved = await $.store.get(MODE_STORE_KEY)
-    await update($, mode, () => (saved === 'auto' ? 'auto' : 'hold'))
     const savedEnabled = await $.store.get(ENABLED_STORE_KEY)
     await update($, enabled, () => savedEnabled !== false)
     const savedChat = await $.store.get(await chatStoreKey($))
@@ -739,14 +568,19 @@ export const register: Register = on => {
     return { sections: [...composed.sections, { id: 'claudevoice-call', text: SPOKEN_STYLE, scope: 'session' }] }
   })
 
+  // You started talking or typing into the box: Claude stops talking.
+  on('prompt.edit', async ($, e, next) => {
+    const result = await next(e)
+    if (result.text.trim() !== '' && (await read($, isCall)) && (await read($, phase)) === 'speaking') await stop($)
+    return result
+  })
+
   on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined && (await read($, isCall))) {
-      await update($, phase, () => 'thinking')
-    }
+    if (e.agentId === undefined && (await read($, isCall))) await setPhase($, 'thinking')
     return next(e)
   })
 
-  // In a call, every finished reply is spoken, then we listen again.
+  // In a call, every finished reply is spoken; then it is your turn.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId !== undefined || !(await read($, isCall))) return result
@@ -754,10 +588,10 @@ export const register: Register = on => {
     $.clock.after(0, () => {
       void (async () => {
         if (answer !== '' && !e.isAborted && (await speak($, answer))) {
-          await update($, phase, () => 'speaking')
+          await setPhase($, 'speaking')
           watchPlayback($)
         } else {
-          void listenOnce($)
+          await setPhase($, 'listening')
         }
       })()
     })
@@ -768,7 +602,7 @@ export const register: Register = on => {
   on('audio.speak', async ($, e, next) => {
     if (!(await isEnabled($))) return next(e)
     if (await speak($, e.text)) {
-      await update($, phase, () => 'speaking')
+      await setPhase($, 'speaking')
       watchPlayback($)
     }
     return { value: { via: 'system' as const } }
@@ -783,7 +617,7 @@ export const register: Register = on => {
     return controls($, e, true)
   })
 
-  // The optional pane (/voice-panel) adds what was heard and any error.
+  // The optional pane (/voice-panel) adds what was sent and any error.
   on('ui.render', { component: 'Pane', requestId: PANE }, ($, e) => controls($, e, false))
 
   // The gear's settings dialog.
