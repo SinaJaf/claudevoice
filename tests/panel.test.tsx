@@ -100,7 +100,7 @@ test('Read aloud speaks the last reply through the Kokoro server', async ($, on)
   }
 })
 
-test('A call: you talk with the mic, Done sends the prompt box, the answer is spoken', async ($, on) => {
+test('A call: the mic records until Done, the words are sent, the answer is spoken, the mic reopens', async ($, on) => {
   const state = { speaking: false }
   const w = world(on, state)
   const clock = mock.clock(on)
@@ -110,36 +110,40 @@ test('A call: you talk with the mic, Done sends the prompt box, the answer is sp
   expect(await ui.find({ type: 'Text', text: /Auto/ })).toBeDefined()
 
   await ui.press({ key: 'call' })
+  expect(w.runs.some(argv => argv.includes('--warm'))).toBe(true)
   expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('press Done')
-  // No speech-to-text of our own: nothing records the microphone.
-  expect(w.runs.some(argv => argv.includes('claudevoice.listen'))).toBe(false)
   // The controls stand in place for the whole call.
-  for (const key of ['done', 'stop', 'settings', 'end']) expect(await ui.find({ key })).toBeDefined()
+  for (const key of ['done', 'mute', 'stop', 'settings', 'end']) expect(await ui.find({ key })).toBeDefined()
 
-  // Greeting ends: your turn.
+  // Greeting ends: the mic opens on its own, in hold mode, detached.
   state.speaking = false
   await clock.advance(400)
-  expect(await ui.find({ type: 'Text', text: /your turn/ })).toBeDefined()
+  const listen = w.runs.find(argv => argv.includes('claudevoice.listen') && !argv.includes('--warm'))
+  expect(listen).toContain('--manual')
+  expect(listen).toContain('--detach')
+  expect(await ui.find({ type: 'Text', text: /listening/ })).toBeDefined()
 
-  // Done with an empty box sends nothing.
+  // Done tells the listener to finish; its words are sent.
+  expect(listen).toContain('--heartbeat')
   await ui.press({ key: 'done' })
-  expect(w.submitted).toEqual([])
-
-  // Claude's dictation filled the box; Done sends it and clears the box.
-  w.box.text = 'what time is it'
-  await ui.press({ key: 'done' })
+  expect(w.written.some(p => p.endsWith('listen.done'))).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /writing down/ })).toBeDefined()
+  await clock.advance(400)
   expect(w.submitted).toEqual(['what time is it'])
-  expect(w.box.text).toBe('')
 
-  // Claude answers: the reply is spoken.
+  // Claude answers: the reply is spoken, then the mic opens again by itself.
   w.fetches.length = 0
+  w.runs.length = 0
   await $.turn.complete({ answer: 'It is about noon.', reason: 'answer', durationMs: 50, isAborted: false, turnId: 't1' })
   await clock.advance(10)
   expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('It is about noon.')
+  state.speaking = false
+  await clock.advance(400)
+  expect(w.runs.some(argv => argv.includes('claudevoice.listen'))).toBe(true)
 
-  // Hang up: the voice stops and the footer offers Call again.
+  // Hang up: the listener is told to stop and the footer offers Call again.
   await ui.press({ key: 'end' })
-  expect(w.fetches.some(f => f.url.endsWith('/stop'))).toBe(true)
+  expect(w.written.some(p => p.endsWith('listen.stop'))).toBe(true)
   expect(await ui.find({ type: 'Button', text: /Call/ })).toBeDefined()
   await ui.unmount()
 })
@@ -178,6 +182,8 @@ test('The gear opens settings; picking a cloud voice writes the config', async (
     await pane.select({ key: 'speaking', value: 'openai:nova' })
     expect(w.runs.some(argv => argv.slice(-3).join(' ') === 'config tts_engine openai')).toBe(true)
     expect(w.runs.some(argv => argv.slice(-3).join(' ') === 'config tts_voice nova')).toBe(true)
+    await pane.select({ key: 'listening', value: 'apple:' })
+    expect(w.runs.some(argv => argv.slice(-3).join(' ') === 'config stt_engine apple')).toBe(true)
     await pane.select({ key: 'speed', value: '1.15' })
     expect(w.runs.some(argv => argv.slice(-3).join(' ') === 'config speed 1.15')).toBe(true)
     await pane.unmount()
@@ -208,7 +214,7 @@ test('Switched off, only the gear stays; switched on, the controls return', asyn
   await footer.unmount()
 })
 
-test('Stop cuts the voice and hands you the turn', async ($, on) => {
+test('Stop cuts the voice and the mic opens; Mute pauses it without losing the take', async ($, on) => {
   const state = { speaking: false }
   const w = world(on, state)
   const clock = mock.clock(on)
@@ -220,7 +226,14 @@ test('Stop cuts the voice and hands you the turn', async ($, on) => {
   await ui.press({ key: 'stop' })
   expect(w.fetches.some(f => f.url.endsWith('/stop'))).toBe(true)
   await clock.advance(400)
-  expect(await ui.find({ type: 'Text', text: /your turn/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /listening/ })).toBeDefined()
+
+  await ui.press({ key: 'mute' })
+  expect(w.writes.filter(x => x.path.endsWith('listen.mute')).pop()?.content).toBe('1')
+  expect(w.written.some(p => p.endsWith('listen.stop'))).toBe(false)
+  expect(await ui.find({ type: 'Text', text: /mic muted/ })).toBeDefined()
+  await ui.press({ key: 'mute' })
+  expect(w.writes.filter(x => x.path.endsWith('listen.mute')).pop()?.content).toBe('0')
   await ui.unmount()
 })
 

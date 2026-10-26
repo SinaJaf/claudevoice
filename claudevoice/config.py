@@ -31,9 +31,12 @@ DEFAULTS: dict = {
     "port": 8765,
     # Longest reply (after markdown cleanup) that the Stop hook will read aloud.
     "max_chars": 2500,
-    # Listening (speech-to-text). "local" runs mlx-whisper on the Mac; "openai" posts the
-    # audio to an OpenAI-compatible /audio/transcriptions endpoint (OpenAI, Groq, ...).
-    "stt_engine": "local",
+    # Listening (speech-to-text). "apple" is the Mac's own recognizer (the engine behind
+    # macOS dictation), on-device; "local" runs Whisper; "openai" posts the audio to an
+    # OpenAI-compatible /audio/transcriptions endpoint. "auto": apple on macOS, else local.
+    "stt_engine": "auto",
+    # Language for the apple engine, e.g. "en-US"; empty follows the Mac's language.
+    "stt_language": "",
     # Short name: small, medium, large-v3-turbo, large-v3 (mapped to the backend's repo).
     "whisper_model": "large-v3-turbo",
     "stt_model": "gpt-4o-mini-transcribe",

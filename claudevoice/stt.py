@@ -1,11 +1,17 @@
-"""Speech-to-text: local mlx-whisper, or an OpenAI-compatible cloud endpoint."""
+"""Speech-to-text: Apple's on-device recognizer, local Whisper, or an OpenAI-compatible cloud endpoint."""
 from __future__ import annotations
 
 import io
 import json
 import logging
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 import urllib.request
+from pathlib import Path
 import uuid
 import warnings
 
@@ -131,7 +137,141 @@ class CloudTranscriber:
         return _clean(data.get("text") or "")
 
 
+_APPLE_SRC = Path(__file__).parent / "apple"
+PIECE_SECONDS = 50  # Apple's recognizer returns only the last stretch of longer audio
+
+
+def apple_helper() -> Path:
+    """The ClaudeVoiceSTT.app helper, built from the shipped Swift source when missing or stale.
+
+    macOS grants speech recognition only to an app that declares why it wants it, so
+    the recognizer runs in this small signed app rather than in Python.
+    """
+    from . import config
+
+    app = config.CONFIG_DIR / "ClaudeVoiceSTT.app"
+    exe = app / "Contents" / "MacOS" / "ClaudeVoiceSTT"
+    source = _APPLE_SRC / "ClaudeVoiceSTT.swift"
+    plist = _APPLE_SRC / "Info.plist"
+    newest = max(source.stat().st_mtime, plist.stat().st_mtime)
+    if exe.exists() and exe.stat().st_mtime >= newest:
+        return app
+    swiftc = shutil.which("swiftc") or "/usr/bin/swiftc"
+    if not Path(swiftc).exists():
+        raise RuntimeError("the apple engine needs the Xcode command line tools (xcode-select --install)")
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(plist, app / "Contents" / "Info.plist")
+    subprocess.run([swiftc, "-O", "-o", str(exe), str(source)], check=True, capture_output=True, timeout=600)
+    subprocess.run(["codesign", "--force", "-s", "-", str(app)], check=True, capture_output=True, timeout=60)
+    return app
+
+
+def _pieces(audio: np.ndarray, rate: int) -> list[np.ndarray]:
+    """Cut a long take into pieces under PIECE_SECONDS, each cut at the quietest moment nearby."""
+    out: list[np.ndarray] = []
+    start, limit, window = 0, PIECE_SECONDS * rate, int(0.3 * rate)
+    while len(audio) - start > limit:
+        lo, hi = start + int(0.6 * limit), start + limit - window
+        best, best_level = hi, float("inf")
+        for i in range(lo, hi, window // 2):
+            level = float(np.sqrt(np.mean(audio[i : i + window] ** 2)))
+            if level < best_level:
+                best, best_level = i + window // 2, level
+        out.append(audio[start:best])
+        start = best
+    out.append(audio[start:])
+    return out
+
+
+class AppleTranscriber:
+    """The Mac's own speech recognizer (what macOS dictation uses), on-device."""
+
+    def __init__(self, language: str = "") -> None:
+        self.language = language
+
+    def warm(self) -> None:
+        apple_helper()
+
+    def transcribe(self, audio: np.ndarray, language: str | None = None) -> str:  # noqa: ARG002
+        import soundfile as sf
+
+        if len(audio) == 0:
+            return ""
+        app = apple_helper()
+        with tempfile.TemporaryDirectory(prefix="claudevoice-") as tmp:
+            paths = []
+            for k, piece in enumerate(_pieces(audio, 16_000)):
+                path = os.path.join(tmp, f"piece{k}.wav")
+                sf.write(path, piece, 16_000, subtype="PCM_16")
+                paths.append(path)
+            result = os.path.join(tmp, "result.json")
+            # `open` launches it as its own app, so the speech permission is its own.
+            subprocess.run(["open", "-W", "-n", "-g", "-a", str(app), "--args", result, self.language, *paths],
+                           check=True, capture_output=True, timeout=900)
+            deadline = time.time() + 5
+            while not os.path.exists(result) and time.time() < deadline:
+                time.sleep(0.05)
+            data = json.loads(Path(result).read_text()) if os.path.exists(result) else {"error": "no answer from ClaudeVoiceSTT"}
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+        return (data.get("text") or "").strip()
+
+
+def resolve_engine(cfg: dict) -> str:
+    """auto: the system's own recognizer where there is one (macOS, Windows), else Whisper."""
+    engine = cfg.get("stt_engine", "auto")
+    if engine == "auto":
+        return {"darwin": "apple", "win32": "windows"}.get(sys.platform, "local")
+    return engine
+
+
+WINDOWS_SCRIPT = Path(__file__).parent / "windows" / "dictate.ps1"
+
+
+class WindowsDictation:
+    """Windows' own speech recognizer (the engine behind voice typing).
+
+    It listens to the microphone itself, so listen.py hands it the whole turn
+    (see listen_windows) instead of passing it a recording to transcribe.
+    """
+
+    live = True
+
+    def __init__(self, language: str = "") -> None:
+        self.language = language
+
+    def warm(self) -> None:
+        if sys.platform != "win32":
+            raise RuntimeError("the windows engine runs only on Windows")
+
+    def transcribe(self, audio, language=None) -> str:  # noqa: ARG002
+        raise RuntimeError("the windows engine records by itself; use listen_windows")
+
+    def listen(self, *, done_flag: Path, stop_flag: Path, mute_flag: Path, heartbeat: str | None,
+               max_seconds: float) -> dict:
+        with tempfile.TemporaryDirectory(prefix="claudevoice-") as tmp:
+            out = os.path.join(tmp, "result.json")
+            argv = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                    "-File", str(WINDOWS_SCRIPT), "-Out", out, "-DoneFlag", str(done_flag),
+                    "-StopFlag", str(stop_flag), "-MuteFlag", str(mute_flag),
+                    "-MaxSeconds", str(int(max_seconds))]
+            if heartbeat:
+                argv += ["-Heartbeat", heartbeat]
+            if self.language:
+                argv += ["-Language", self.language]
+            ran = subprocess.run(argv, capture_output=True, text=True, timeout=max_seconds + 120)
+            if not os.path.exists(out):
+                tail = (ran.stderr or ran.stdout or "").strip().splitlines()[-1:] or ["no answer"]
+                return {"error": f"Windows speech recognition failed: {tail[0]}"}
+            return json.loads(Path(out).read_text(encoding="utf-8-sig"))
+
+
 def make_transcriber(cfg: dict, whisper_model: str | None = None):
-    if cfg.get("stt_engine", "local") == "openai":
+    engine = resolve_engine(cfg)
+    if engine == "apple":
+        return AppleTranscriber(cfg.get("stt_language", ""))
+    if engine == "windows":
+        return WindowsDictation(cfg.get("stt_language", ""))
+    if engine == "openai":
         return CloudTranscriber(base_url=cfg["stt_base_url"], model=cfg["stt_model"], api_key_env=cfg["stt_api_key_env"])
     return Transcriber(whisper_model or cfg["whisper_model"])

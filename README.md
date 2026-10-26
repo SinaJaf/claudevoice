@@ -1,29 +1,38 @@
 # claudevoice
 
-Voice for [Claude Code](https://claude.com/claude-code): a one-on-one spoken conversation with Claude.
-You talk with Claude Code's own microphone (its built-in dictation), and Claude answers out loud
-with [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), a natural local voice. There is no
-separate speech-to-text model: your words stay exactly as Claude's dictation wrote them.
+Voice for [Claude Code](https://claude.com/claude-code): a one-on-one spoken conversation with Claude,
+right inside the chat. You talk, press **Done**, Claude answers out loud with
+[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (a natural local voice), and the mic opens
+again by itself for your next turn. No clicking the mic on and off between turns.
 
 ```
-Auto · Read aloud · ⚙ · ● Call                               ← idle, in the prompt footer
-● your turn · ✓ Done · ■ Stop · ⚙ · ✕ End call               ← on a call
+Auto · Read aloud · ⚙ · ● Call                                       ← idle, in the prompt footer
+● listening · take your time, then Done · ✓ Done · ◉ Mute · ■ Stop · ⚙ · ✕ End call   ← on a call
 ```
 
-- **● Call**: starts the conversation in this chat. Talk with the app's mic button, pause and think
-  as long as you like, then press **✓ Done**: it sends what's in the prompt box. Claude's reply is
-  read aloud, then it's your turn again. Pressing Enter yourself works too.
-- **■ Stop** cuts Claude's voice and hands you the turn; typing into the box does the same.
-- **✕ End call** stops the voice. It never cancels work Claude is doing.
-- During a call the controls stay in the same places; the one that matters now lights up, and the
-  status animates (your turn, thinking, speaking).
-- **Read aloud** (outside a call): speaks the last reply once.
-- Switch headphones or speakers whenever you like: replies follow the system's current output from
-  the next sentence.
-- **⚙**: the plugin on/off switch, the voice (Kokoro voices, or OpenAI and ElevenLabs cloud voices)
-  and the speed. Off leaves only the gear, so you can turn it back on.
-- **Per-chat settings**: under each setting in the gear, open **▸ this chat** to choose a different
-  value for the chat you're in. Pick **Same as all chats** to go back to the shared setting.
+How a call goes:
+
+1. **● Call** starts it. Claude says it's listening.
+2. Talk. Pause and think as long as you like: nothing is sent until you press **✓ Done**.
+3. Claude's reply is read aloud, then the mic opens again on its own. Back to step 2.
+
+- **◉ Mute** pauses the mic: nothing is recorded while muted, what you already said is kept, and
+  **Unmute** carries on the same turn.
+- **■ Stop** cuts Claude's voice; the mic opens right away.
+- **✕ End call** stops the mic and the voice. It never cancels work Claude is doing.
+- The controls stay in the same places during a call; the one that matters now lights up, and the
+  status animates (listening, thinking, speaking).
+- **Read aloud** (outside a call) speaks the last reply once.
+- **Listening** uses the system's own speech recognizer, which keeps your words as you said them:
+  on a Mac the engine behind macOS dictation (on-device), on Windows the engine behind voice typing.
+  Each asks for permission once. On Linux it uses Whisper locally; OpenAI's cloud transcription is
+  an option everywhere.
+- Switch headphones, speakers or microphones whenever you like: the voice and the mic follow the
+  system's current devices, even mid-turn.
+- **⚙** settings: the plugin on/off switch, listening engine, microphone, voice and speed. Off leaves
+  only the gear, so you can turn it back on.
+- **Per-chat settings**: under each setting, open **▸ this chat** to choose a different value for the
+  chat you're in. Pick **Same as all chats** to go back to the shared setting.
 
 ## Install
 
@@ -45,7 +54,8 @@ the prompt, then **Plugins**, **Add marketplace** with `SinaJaf/claudevoice`, th
 Open sessions pick it up with `/reload-plugins`; new sessions load it on their own.
 
 The first Read aloud or Call sets up the Python environment and downloads the Kokoro voice
-model (~330 MB), so expect a few minutes once. The footer says what it
+model (~330 MB), so expect a few minutes once. On a Mac the first call also builds the small speech
+helper (needs the Xcode command line tools: `xcode-select --install`). The footer says what it
 is doing. Everything lives under the plugin folder and `~/.claudevoice/`.
 
 ## How it works
@@ -53,19 +63,23 @@ is doing. Everything lives under the plugin folder and `~/.claudevoice/`.
 ```
 Claude Code (any surface)
   prompt footer controls  ──$.http──▶  claudevoice server (Kokoro, warm, 127.0.0.1:8765)
-  ● Call: Claude's dictation ─▶ prompt box ─▶ Done ─▶ reply ─▶ speak   └─ speakers
+  ● Call: mic ─▶ Done ─▶ speech-to-text ─▶ prompt ─▶ reply ─▶ speak ─▶ mic   └─ speakers
 ```
 
 - `hooks/register.tsx` is the Claude Code plugin: the footer controls, the settings dialog, the
-  call loop (Done reads the prompt box with `$.prompt.read` and sends it; `turn.complete` speaks
-  the answer), and a spoken-style note Claude receives during calls. It also routes the app's built-in speech calls through the chosen speaking engine.
+  call loop (a detached listener per turn, `$.prompt.submit`, `turn.complete`), and a spoken-style
+  note Claude receives during calls. It also routes the app's built-in speech calls through the chosen speaking engine.
 - `claudevoice/` is the Python side, run through the project's `uv` environment:
   `tts_server.py` keeps Kokoro loaded and plays audio, following the system's output device;
   `clean.py` turns
   markdown into speakable text (code fences become "python code block, 12 lines", paths collapse
   to file names, `app.py:42` reads as "app.py line 42").
-- `listen.py`, `record.py` and `stt.py` (Whisper) serve only the terminal `claudevoice chat`
-  extra below; the plugin never records the microphone itself.
+- `listen.py` records one turn until Done (Mute pauses it) and transcribes it; `record.py` follows
+  the system's input device; `stt.py` picks the engine: `apple/ClaudeVoiceSTT.swift`, a tiny signed
+  helper app running the Mac's on-device recognizer (macOS grants speech recognition only to an
+  app that declares it), `windows/dictate.ps1` driving Windows' recognizer from the built-in
+  Windows PowerShell (it listens to the default mic itself, phrase by phrase, until Done), Whisper (mlx-whisper on Apple Silicon, faster-whisper elsewhere), or a
+  cloud endpoint.
 - Cloud voices are OpenAI-compatible endpoints (OpenAI, Groq, a local server) and ElevenLabs. Keys
   are read from `OPENAI_API_KEY` / `ELEVENLABS_API_KEY` in your environment or login shell; nothing
   secret is written to disk. If a cloud voice can't be used, Kokoro says why and reads the reply.
@@ -80,13 +94,15 @@ The gear covers the common ones. Everything is in `~/.claudevoice/config.json`, 
 | `voice` | `af_heart` | Kokoro voice, or a comma blend (`af_heart,af_bella`); see the model's VOICES.md |
 | `lang_code` | `a` | `a` American, `b` British (Kokoro) |
 | `speed` | `1.05` | playback pace |
+| `stt_engine` | `auto` | `apple` (Mac, on-device), `windows` (Windows), `local` (Whisper), `openai`; `auto` picks the system's own recognizer, Whisper on Linux |
+| `stt_language` | `` | language for the apple and windows engines (`en-US`, `fa-IR`...); empty follows the system |
+| `whisper_model` | `large-v3-turbo` | `small`, `medium`, `large-v3-turbo`, `large-v3` |
+| `input_device` | `` (system default) | microphone name; empty follows the system's input as it changes |
 | `tts_engine` | `kokoro` | `kokoro`, `openai`, `elevenlabs` |
 | `tts_voice`, `tts_model`, `tts_base_url`, `tts_api_key_env` | OpenAI defaults | cloud speech (ElevenLabs voice id goes in `tts_voice`) |
 | `max_chars` | `2500` | longest reply read in full |
 | `port` | `8765` | local server port |
 
-The terminal `claudevoice chat` also reads `stt_engine`, `whisper_model`, `stt_model`,
-`input_device`, `silence_seconds` and `vad_threshold`.
 
 ## Extras (macOS and Linux)
 
@@ -111,8 +127,13 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 ## Troubleshooting
 
 - Logs: `~/.claudevoice/server.log` (speech) and `~/.claudevoice/claudevoice.log` (hooks).
-- Dictation is Claude Code's own: if the mic button types nothing, check the app's microphone
-  permission in your system settings.
+- "speech recognition is not allowed": turn on **Claude Voice transcription** in System Settings,
+  Privacy & Security, Speech Recognition.
+- Windows: "turn on Online speech recognition": Windows Settings, Privacy & security, Speech. The
+  windows engine uses the default microphone (Settings, System, Sound, Input); pick Whisper in the
+  gear to choose a specific one.
+- "The microphone is giving silence": the input carries no signal (lid closed, unplugged, or no
+  microphone permission). Pick another microphone in the gear.
 - Silent after picking a cloud voice: the key isn't visible to the server. Export it in your shell
   profile and run `claudevoice stop-server` (it restarts on the next use).
 - spaCy error "Python int too large to convert to C ssize_t": `preshed` must stay pinned to 3.0.10.

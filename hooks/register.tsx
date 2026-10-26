@@ -20,6 +20,8 @@ const chat = atom({ plugin: 'claudevoice', key: 'chat' } as const, {} as ChatSet
 const chatOpen = atom({ plugin: 'claudevoice', key: 'chatOpen' } as const, {} as Record<string, boolean>)
 /** Animation frame counter for the footer's live status. */
 const tick = atom({ plugin: 'claudevoice', key: 'tick' } as const, 0)
+/** In a call: the microphone records nothing until unmuted; what came before is kept. */
+const muted = atom({ plugin: 'claudevoice', key: 'muted' } as const, false)
 const CHAT_STORE_PREFIX = 'chat:'
 const SAME_AS_ALL = '__all__'
 const ENABLED_STORE_KEY = 'enabled'
@@ -134,6 +136,28 @@ async function setChatSetting($: Engine, key: keyof ChatSettings, value: string)
   if (key === 'plugin' && !(await isEnabled($))) await quiet($)
 }
 
+/** Listener flags for this chat's listening engine and microphone, if it has its own. */
+async function listenOverrides($: Engine): Promise<string[]> {
+  const c = await read($, chat)
+  const args: string[] = []
+  if (c.listening !== undefined) {
+    const [engine, model] = c.listening.split(':', 2) as [string, string]
+    args.push(`--stt=${engine}`)
+    if (engine === 'local') args.push(`--whisper=${model}`)
+    if (engine === 'openai') args.push(`--stt-model=${model}`)
+  }
+  if (c.microphone !== undefined) args.push(`--device=${c.microphone}`)
+  return args
+}
+
+async function touch($: Engine, name: string, text = ''): Promise<void> {
+  try {
+    await $.fs.write(await flagPath($, name), text)
+  } catch {
+    // no flag: the listener carries on as it was
+  }
+}
+
 async function speak($: Engine, text: string): Promise<boolean> {
   if (!(await ensureServer($))) return false
   // This chat's voice and speed, when it has its own; the server uses the config otherwise.
@@ -167,8 +191,9 @@ async function stopSpeaking($: Engine): Promise<void> {
 
 
 // ---- the features -----------------------------------------------------------------
-// You talk with Claude's own microphone (its dictation fills the prompt box); this
-// plugin sends what is there when you press Done and speaks every reply back.
+// A call is a back-and-forth: the plugin's own mic records you until you press Done
+// (pause and think as long as you like), the words go to Claude, Claude's reply is
+// read aloud, and the mic opens again by itself.
 
 async function setPhase($: Engine, p: VoicePhase): Promise<void> {
   await update($, phase, () => p)
@@ -182,7 +207,7 @@ function startTicker($: Engine): void {
   if (ticking) return
   ticking = true
   const step = (): void => {
-    $.clock.after(250, () => {
+    $.clock.after(500, () => {
       void (async () => {
         if ((await read($, phase)) === 'idle') {
           ticking = false
@@ -209,11 +234,11 @@ async function readAloud($: Engine): Promise<void> {
   watchPlayback($)
 }
 
-/** Poll the server until playback ends; in a call it is then your turn. */
+/** Poll the server until playback ends; in a call the mic then opens again. */
 function watchPlayback($: Engine): void {
   $.clock.after(300, () => {
     void (async () => {
-      if ((await read($, phase)) !== 'speaking') return // stopped, or a new turn began
+      if ((await read($, phase)) !== 'speaking') return // a new turn began
       const h = await health($)
       if (h?.speaking) {
         watchPlayback($)
@@ -223,59 +248,158 @@ function watchPlayback($: Engine): void {
         await update($, note, () => h.last_error ?? '')
         $.ui.toast(h.last_error)
       }
-      await setPhase($, (await read($, isCall)) ? 'listening' : 'idle')
+      if (await read($, isCall)) void listenOnce($)
+      else await setPhase($, 'idle')
     })()
   })
+}
+
+/** Record until Done, transcribe, send. The listener runs detached and answers through a
+ *  file, so a take is not bound by the 10-minute limit on a plugin command. */
+async function listenOnce($: Engine): Promise<void> {
+  if (!(await read($, isCall))) return
+  await setPhase($, 'listening')
+  const session = (await $.session.id()).replace(/[^A-Za-z0-9_-]/g, '')
+  const resultPath = await flagPath($, `listen-${session}-${await $.clock.now()}.json`)
+  // The heartbeat tells the listener someone is still waiting; it gives up if it goes stale.
+  const heartbeat = await flagPath($, 'listen.alive')
+  await touch($, 'listen.alive', String(await $.clock.now()))
+  const argv = [...(await python($)), '-m', 'claudevoice.listen', ...(await listenOverrides($)),
+    '--manual', '--result', resultPath, '--heartbeat', heartbeat, '--detach']
+  const ran = await $.process.run(argv, { cwd: root($), timeoutMs: 60000 })
+  if (ran.exitCode !== 0) {
+    await endCall($, `listening failed: ${ran.stderr.trim().split('\n').pop() ?? 'unknown error'}`)
+    return
+  }
+  awaitTake($, resultPath)
+}
+
+/** Check for the listener's answer every 300 ms, then act on it. */
+function awaitTake($: Engine, resultPath: string): void {
+  $.clock.after(300, () => {
+    void (async () => {
+      if (!(await read($, isCall))) return // hung up: the listener was told to stop
+      await touch($, 'listen.alive', String(await $.clock.now()))
+      let raw = ''
+      try {
+        if (await $.fs.exists(resultPath)) raw = String(await $.fs.read(resultPath))
+      } catch {
+        raw = ''
+      }
+      if (raw === '') {
+        awaitTake($, resultPath)
+        return
+      }
+      await handleTake($, raw)
+    })()
+  })
+}
+
+async function handleTake($: Engine, raw: string): Promise<void> {
+  if (!(await read($, isCall))) return
+  let parsed: { text?: string; cancelled?: boolean; silent?: boolean; busy?: boolean; device?: string; error?: string } = {}
+  try {
+    parsed = JSON.parse(raw.trim()) as typeof parsed
+  } catch {
+    parsed = {}
+  }
+  // A newer listener took over this take; that one carries on.
+  if (parsed.cancelled === true) return
+  if (parsed.busy === true) {
+    // The mic could not be taken over in time: try again shortly rather than go quiet.
+    $.clock.after(1000, () => void listenOnce($))
+    return
+  }
+  if ((parsed.error ?? '') !== '') {
+    await endCall($, `listening failed: ${parsed.error}`)
+    $.ui.toast(`listening failed: ${parsed.error}`)
+    return
+  }
+  if (parsed.silent === true) {
+    const why = `The microphone "${parsed.device ?? ''}" is giving silence. Check it is connected and allowed, or pick another one in the voice settings.`
+    await endCall($, why)
+    $.ui.toast(why)
+    return
+  }
+  const text = (parsed.text ?? '').trim()
+  if (text === '') {
+    $.ui.toast("I didn't catch any words; still listening")
+    void listenOnce($)
+    return
+  }
+  await update($, heard, () => text)
+  await setPhase($, 'thinking')
+  await $.prompt.submit({ text })
 }
 
 async function startCall($: Engine): Promise<void> {
   if (await read($, isCall)) return
   await update($, isCall, () => true)
+  await update($, muted, () => false)
+  await touch($, 'listen.mute', '0')
   await update($, note, () => '')
   await setPhase($, 'loading')
   if (!(await ensureServer($))) {
     await endCall($, '')
     return
   }
-  if (await speak($, "I'm here. Talk with the mic, take your time, and press Done when you've finished.")) {
+  // Loads the listening engine (and builds the Mac's speech helper the first time).
+  const warm = await $.process.run([...(await python($)), '-m', 'claudevoice.listen', ...(await listenOverrides($)), '--warm'], { cwd: root($), timeoutMs: 600000 })
+  if (warm.exitCode !== 0) {
+    await endCall($, `could not start listening: ${warm.stderr.trim().split('\n').pop() ?? ''}`)
+    return
+  }
+  if (await speak($, "I'm listening. Take your time, and press Done when you've finished.")) {
     await setPhase($, 'speaking')
     watchPlayback($)
   } else {
-    await setPhase($, 'listening')
+    void listenOnce($)
   }
 }
 
-/** Hang up: stop the voice. Never touches the work Claude is doing. */
+/** Hang up: stop the mic and the voice. Never touches the work Claude is doing. */
 async function endCall($: Engine, reason: string): Promise<void> {
   await update($, isCall, () => false)
+  await update($, muted, () => false)
+  await touch($, 'listen.mute', '0')
   await setPhase($, 'idle')
   await update($, note, () => reason)
+  await touch($, 'listen.stop')
   await stopSpeaking($)
 }
 
-/** Send what your dictation (or typing) left in the prompt box. */
+/** Finish talking: what you said goes to Claude. */
 async function done($: Engine): Promise<void> {
-  const { text } = await $.prompt.read()
-  const said = text.trim()
-  if (said === '') {
-    $.ui.toast('Nothing in the prompt box yet: talk with the mic first')
-    return
-  }
-  if ((await read($, phase)) === 'speaking') await stopSpeaking($)
-  await $.prompt.fill({ text: '' })
-  await update($, heard, () => said)
-  await setPhase($, 'thinking')
-  await $.prompt.submit({ text: said })
+  if ((await read($, phase)) !== 'listening') return
+  await touch($, 'listen.done')
+  await setPhase($, 'transcribing') // the listener now turns what you said into text
 }
 
-/** Stop Claude's voice; in a call it is your turn right away. */
+/** Mute pauses the mic: nothing is recorded while muted, what came before is kept,
+ *  Unmute carries on the same take, and Done still sends it. */
+async function toggleMute($: Engine): Promise<void> {
+  const next = !(await read($, muted))
+  await update($, muted, () => next)
+  await touch($, 'listen.mute', next ? '1' : '0')
+}
+
+/** Stop Claude's voice; in a call the mic opens right away. */
 async function stop($: Engine): Promise<void> {
-  await stopSpeaking($)
-  if ((await read($, phase)) === 'speaking') await setPhase($, (await read($, isCall)) ? 'listening' : 'idle')
+  await stopSpeaking($) // watchPlayback notices and, in a call, listens again
 }
 
 // ---- settings ----------------------------------------------------------------------
 
+const LISTENING: readonly [string, string][] = [
+  ['apple:', "Mac's own speech recognition, on-device (macOS only)"],
+  ['windows:', "Windows' own speech recognition, as in voice typing (Windows only)"],
+  ['local:small', 'Local Whisper small (fast)'],
+  ['local:medium', 'Local Whisper medium'],
+  ['local:large-v3-turbo', 'Local Whisper large v3 turbo'],
+  ['local:large-v3', 'Local Whisper large v3 (most accurate Whisper)'],
+  ['openai:gpt-4o-transcribe', 'Cloud: OpenAI gpt-4o-transcribe'],
+  ['openai:gpt-4o-mini-transcribe', 'Cloud: OpenAI gpt-4o-mini-transcribe'],
+]
 const KOKORO_VOICES: readonly [string, string][] = [
   ['af_heart', 'Heart (US, warm)'], ['af_bella', 'Bella (US)'], ['af_nicole', 'Nicole (US, soft)'],
   ['am_michael', 'Michael (US)'], ['am_fenrir', 'Fenrir (US)'],
@@ -295,6 +419,16 @@ async function loadSettings($: Engine): Promise<VoiceSettings> {
   }
   const flat: VoiceSettings = {}
   for (const [k, v] of Object.entries(parsed)) flat[k] = String(v)
+  // The microphones on this machine, newline-separated; the default one tagged.
+  const mics = await $.process.run([...py, '-m', 'claudevoice.listen', '--devices'], { cwd: root($), timeoutMs: 60000 })
+  try {
+    const list = JSON.parse(mics.stdout.trim().split('\n').pop() ?? '[]') as { name: string; default: boolean }[]
+    flat._microphones = list.map(d => (d.default ? `${d.name}\t(system default)` : d.name)).join('\n')
+  } catch {
+    flat._microphones = ''
+  }
+  const platform = await $.process.run([...py, '-c', 'import sys; print(sys.platform)'], { cwd: root($), timeoutMs: 60000 })
+  flat._platform = platform.stdout.trim()
   await update($, settings, () => flat)
   return flat
 }
@@ -307,7 +441,23 @@ async function setSetting($: Engine, key: string, value: string): Promise<void> 
 
 async function openSettings($: Engine): Promise<void> {
   await loadSettings($)
-  await $.ui.open({ id: SETTINGS_PANE, title: 'Voice settings', focus: true, closeOnEscape: true, rows: 22 })
+  await $.ui.open({ id: SETTINGS_PANE, title: 'Voice settings', focus: true, closeOnEscape: true, rows: 30 })
+}
+
+/** "apple:", "windows:", "local:<size>" or "openai:<model>" from the config, and back. */
+function listeningValue(s: VoiceSettings, platform: string): string {
+  const system = platform === 'darwin' ? 'apple' : platform === 'win32' ? 'windows' : 'local'
+  const engine = s.stt_engine === 'auto' || s.stt_engine === undefined ? system : s.stt_engine
+  if (engine === 'apple') return 'apple:'
+  if (engine === 'windows') return 'windows:'
+  if (engine === 'openai') return `openai:${s.stt_model ?? ''}`
+  return `local:${(s.whisper_model ?? 'large-v3-turbo').replace(/^.*\/whisper-/, '').replace(/-mlx$/, '')}`
+}
+async function pickListening($: Engine, value: string): Promise<void> {
+  const [engine, model] = value.split(':', 2) as [string, string]
+  await setSetting($, 'stt_engine', engine)
+  if (engine === 'local') await setSetting($, 'whisper_model', model)
+  if (engine === 'openai') await setSetting($, 'stt_model', model)
 }
 
 function speakingValue(s: VoiceSettings): string {
@@ -346,11 +496,15 @@ async function liveStatus($: Engine, e: Surface) {
   const { Box, Text } = $.ui.resolve(e)
   const current = await read($, phase)
   const t = await read($, tick)
+  const isMuted = await read($, muted)
   if (current === 'idle') return null
   const glyph = (text: string, color: string) => <Text key="glyph" color={color}>{text}</Text>
   const parts = {
     loading: [glyph(SPINNER[t % SPINNER.length] ?? '', 'claude'), 'starting the voice'],
-    listening: [glyph(t % 4 < 2 ? '●' : '○', 'success'), 'your turn · talk with the mic, then Done'],
+    listening: isMuted
+      ? [glyph('◌', 'warning'), 'mic muted · what you said is kept']
+      : [glyph(t % 4 < 2 ? '●' : '○', 'error'), 'listening · take your time, then Done'],
+    transcribing: [glyph(SPINNER[t % SPINNER.length] ?? '', 'claude'), 'writing down what you said'],
     thinking: [glyph(SPINNER[t % SPINNER.length] ?? '', 'claude'), 'thinking'],
     speaking: [glyph(WAVE[t % WAVE.length] ?? '', 'claude'), 'speaking'],
   }[current]
@@ -379,6 +533,8 @@ async function controls($: Engine, e: Surface, compact: boolean) {
         {!inCall && <Button key="read" label="Read aloud" hotkey="r" plain onPress={() => void readAloud($)} />}
         {!inCall && <Text> </Text>}
         {inCall && <Button key="done" label="Done" hotkey="d" variant="primary" onPress={() => void done($)} />}
+        {inCall && <Text> </Text>}
+        {inCall && <Button key="mute" label={(await read($, muted)) ? 'Unmute' : 'Mute'} hotkey="u" plain onPress={() => void toggleMute($)} />}
         {inCall && <Text> </Text>}
         {(inCall || current === 'speaking') && <Button key="stop" label="Stop" hotkey="s" plain onPress={() => void stop($)} />}
         {(inCall || current === 'speaking') && <Text> </Text>}
@@ -420,6 +576,7 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   }
 
   const status = await liveStatus($, e)
+  const isMuted = await read($, muted)
   const yourTurn = current === 'listening'
   const speaking = current === 'speaking'
   return (
@@ -434,6 +591,13 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
         <Box key="done-box">
           <Text color={yourTurn ? 'success' : undefined} dimColor={!yourTurn}>✓ </Text>
           <Button key="done" label="Done" plain dimColor={!yourTurn} {...(yourTurn ? lit : { hover: quiet.hover })} onPress={() => void done($)} />
+        </Box>
+      )}
+      {inCall && sep}
+      {inCall && (
+        <Box key="mute-box">
+          <Text color={isMuted ? 'warning' : undefined} dimColor={!isMuted}>{isMuted ? '◌ ' : '◉ '}</Text>
+          <Button key="mute" label={isMuted ? 'Unmute' : 'Mute'} plain dimColor={!isMuted} {...(isMuted ? lit : { hover: quiet.hover })} onPress={() => void toggleMute($)} />
         </Box>
       )}
       {inCall && sep}
@@ -477,6 +641,14 @@ async function settingsPane($: Engine, e: Surface) {
   const plugin: Option[] = [
     { value: 'on', label: 'On: voice controls in the prompt footer' },
     { value: 'off', label: 'Off: only the gear stays, to turn it back on' },
+  ]
+  const listening: Option[] = LISTENING.map(([value, label]) => ({ value, label }))
+  const microphones: Option[] = [
+    { value: '', label: 'System default (follows your system)' },
+    ...(s._microphones ?? '').split('\n').filter(x => x !== '').map(line => {
+      const [name, tag] = line.split('\t') as [string, string | undefined]
+      return { value: name, label: tag ? `${name} ${tag}` : name }
+    }),
   ]
   const speaking: Option[] = [
     ...KOKORO_VOICES.map(([v, label]) => ({ value: `kokoro:${v}`, label: `Local Kokoro: ${label}` })),
@@ -529,11 +701,13 @@ async function settingsPane($: Engine, e: Surface) {
       <Text dimColor>Each choice applies to all chats. Open "this chat" under a setting to change it for this chat only.</Text>
       <Box marginTop={1} flexDirection="column">
         {row('plugin', 'Voice plugin', plugin, isOn ? 'on' : 'off', (v: string) => void setEnabled($, v === 'on'), true)}
+        {row('listening', 'Listening (speech to text)', listening, listeningValue(s, s._platform ?? ''), (v: string) => void pickListening($, v))}
+        {row('microphone', 'Microphone', microphones, s.input_device ?? '', (v: string) => void setSetting($, 'input_device', v))}
         {row('speaking', 'Speaking (text to speech)', speaking, speakingValue(s), (v: string) => void pickSpeaking($, v))}
         {row('speed', 'Speed', speeds, String(Number(s.speed ?? '1.05')), (v: string) => void setSetting($, 'speed', v))}
       </Box>
       <Box marginTop={1}>
-        <Text dimColor>You talk with Claude's own microphone. Cloud voices read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>
+        <Text dimColor>The Mac's and Windows' own recognizers keep your words as you said them; each asks for permission once. Cloud engines read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>
       </Box>
       <Box marginTop={1}>
         <Button key="close" label="Close" role="dismiss" onPress={() => void $.ui.close({ id: SETTINGS_PANE })} />
@@ -591,7 +765,7 @@ export const register: Register = on => {
           await setPhase($, 'speaking')
           watchPlayback($)
         } else {
-          await setPhase($, 'listening')
+          void listenOnce($)
         }
       })()
     })

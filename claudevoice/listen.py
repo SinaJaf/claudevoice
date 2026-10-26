@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -26,14 +27,11 @@ from .stt import make_transcriber
 
 HOLD_MAX_SECONDS = 3600.0  # one hour: a runaway guard; only Done ends a hold-mode take
 RESULT_MAX_AGE = 24 * 3600  # result files older than this are swept
+HEARTBEAT_STALE = 20.0  # no heartbeat from the plugin for this long: nobody is waiting, stop
+_preempted = threading.Event()  # a newer listener took the mic, or the plugin went away
 
 
-def _take_lock():
-    """Hold an exclusive lock for this recording; None if another listener has it.
-
-    Two listeners on one microphone would transcribe the same words twice and
-    send them twice. The OS drops the lock when the process ends, even on a crash.
-    """
+def _try_lock():
     config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     handle = open(config.LISTEN_LOCK, "a+")
     try:
@@ -49,6 +47,38 @@ def _take_lock():
     except OSError:
         handle.close()
         return None
+    return handle
+
+
+def _take_lock(timeout: float = 10.0):
+    """Hold the microphone for this recording, taking it over from any older listener.
+
+    One listener at a time, so the same words are never sent twice. The newest one
+    wins: an older listener (a call that was abandoned, a reloaded plugin) is told
+    to stop and gives up its take. The OS drops the lock when a process ends.
+    """
+    handle = _try_lock()
+    if handle is None:
+        pid_file = config.CONFIG_DIR / "listen.pid"
+        try:
+            old = int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            old = 0
+        if old and old != os.getpid():
+            try:
+                if os.name == "nt":
+                    # /T: its PowerShell recognizer goes too
+                    subprocess.run(["taskkill", "/PID", str(old), "/T", "/F"], capture_output=True, timeout=10)
+                else:
+                    os.kill(old, signal.SIGTERM)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        deadline = time.time() + timeout
+        while handle is None and time.time() < deadline:
+            time.sleep(0.1)
+            handle = _try_lock()
+    if handle is not None:
+        (config.CONFIG_DIR / "listen.pid").write_text(str(os.getpid()))
     return handle
 
 
@@ -111,10 +141,12 @@ def _listen(argv: list[str], result_path: str | None) -> int:
                     help="hold mode: keep recording until the done flag appears, ignore pauses")
     ap.add_argument("--devices", action="store_true", help="list microphones as JSON and exit")
     # Per-chat overrides from the plugin; absent means the config file's value.
-    ap.add_argument("--stt", choices=["local", "openai"], default=None, help="speech-to-text engine")
+    ap.add_argument("--stt", choices=["auto", "apple", "windows", "local", "openai"], default=None, help="speech-to-text engine")
     ap.add_argument("--stt-model", default=None, help="cloud transcription model")
     ap.add_argument("--device", default=None, help="microphone name; empty for the system default")
     ap.add_argument("--result", default=None, help="also write the JSON answer to this file")
+    ap.add_argument("--heartbeat", default=None,
+                    help="a file the caller keeps touching while it waits; stale means give up")
     args = ap.parse_args(argv)
     if args.stt:
         cfg["stt_engine"] = args.stt
@@ -128,15 +160,11 @@ def _listen(argv: list[str], result_path: str | None) -> int:
         return 0
 
     if not args.warm:
+        # SIGTERM from a newer listener: give up this take quietly.
+        if os.name != "nt":
+            signal.signal(signal.SIGTERM, lambda *_: _preempted.set())
         lock = _take_lock()
         if lock is None:
-            # Another listener is already recording and will send what was said.
-            # Wait for it to finish before answering, so a caller that simply
-            # listens again never spins in a tight loop.
-            while lock is None:
-                time.sleep(0.25)
-                lock = _take_lock()
-            lock.close()
             _emit({"text": "", "seconds": 0, "busy": True}, result_path)
             return 0
     stt = make_transcriber(cfg, args.whisper)
@@ -152,8 +180,21 @@ def _listen(argv: list[str], result_path: str | None) -> int:
 
     muted = threading.Event()
 
+    heartbeat = os.path.expanduser(args.heartbeat) if args.heartbeat else None
+
+    def orphaned() -> bool:
+        if not heartbeat:
+            return False
+        try:
+            return time.time() - os.path.getmtime(heartbeat) > HEARTBEAT_STALE
+        except OSError:
+            return True
+
     def watch_flags() -> None:
         while not stop_event.is_set():
+            if _preempted.is_set() or orphaned():
+                _preempted.set()
+                stop_event.set()
             if config.LISTEN_STOP_FLAG.exists() or config.LISTEN_DONE_FLAG.exists():
                 stop_event.set()
             try:
@@ -166,6 +207,19 @@ def _listen(argv: list[str], result_path: str | None) -> int:
                 muted.clear()
             time.sleep(0.1)
 
+    if getattr(stt, "live", False):
+        # Windows: the system recognizer listens to the mic itself and watches the same flags.
+        result = stt.listen(done_flag=config.LISTEN_DONE_FLAG, stop_flag=config.LISTEN_STOP_FLAG,
+                            mute_flag=config.LISTEN_MUTE_FLAG, heartbeat=heartbeat,
+                            max_seconds=HOLD_MAX_SECONDS if args.manual else args.max_seconds)
+        config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
+        config.LISTEN_DONE_FLAG.unlink(missing_ok=True)
+        result.setdefault("text", "")
+        result["seconds"] = round(time.time() - t0, 1)
+        result["device"] = "default microphone"
+        _emit(result, result_path)
+        return 0
+
     threading.Thread(target=watch_flags, daemon=True).start()
     # Hold mode: pauses never end the recording; only the Done button does (or the cap).
     silence = 1e9 if args.manual else cfg["silence_seconds"]
@@ -175,7 +229,7 @@ def _listen(argv: list[str], result_path: str | None) -> int:
     audio = record(silence_seconds=silence, threshold=cfg["vad_threshold"],
                    max_seconds=max_seconds, stop_event=stop_event,
                    device=cfg.get("input_device", ""), info=used, paused=muted.is_set)
-    cancelled = config.LISTEN_STOP_FLAG.exists()
+    cancelled = config.LISTEN_STOP_FLAG.exists() or _preempted.is_set()
     stop_event.set()
     config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
     config.LISTEN_DONE_FLAG.unlink(missing_ok=True)
