@@ -187,19 +187,22 @@ async function listenOnce($: Engine): Promise<void> {
   let text = ''
   let cancelled = false
   let silent = false
+  let busy = false
   let device = ''
   try {
     const parsed = JSON.parse(ran.stdout.trim().split('\n').pop() ?? '{}') as {
-      text?: string; cancelled?: boolean; silent?: boolean; device?: string
+      text?: string; cancelled?: boolean; silent?: boolean; busy?: boolean; device?: string
     }
     text = (parsed.text ?? '').trim()
     cancelled = parsed.cancelled === true
     silent = parsed.silent === true
+    busy = parsed.busy === true
     device = parsed.device ?? ''
   } catch {
     text = ''
   }
-  if (cancelled) return
+  // Another listener already has the microphone and will send what was said.
+  if (cancelled || busy) return
   if (silent) {
     // The input carried no signal at all: unplugged, lid closed, or no permission.
     const why = `The microphone "${device}" is giving silence. Check it is connected and allowed, or pick another one in the voice settings.`

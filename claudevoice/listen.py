@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -17,6 +18,30 @@ import numpy as np
 from . import config
 from .record import device_name, input_devices, record, resolve_device
 from .stt import make_transcriber
+
+
+def _take_lock():
+    """Hold an exclusive lock for this recording; None if another listener has it.
+
+    Two listeners on one microphone would transcribe the same words twice and
+    send them twice. The OS drops the lock when the process ends, even on a crash.
+    """
+    config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    handle = open(config.LISTEN_LOCK, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +59,18 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(input_devices()))
         return 0
 
+    if not args.warm:
+        lock = _take_lock()
+        if lock is None:
+            # Another listener is already recording and will send what was said.
+            # Wait for it to finish before answering, so a caller that simply
+            # listens again never spins in a tight loop.
+            while lock is None:
+                time.sleep(0.25)
+                lock = _take_lock()
+            lock.close()
+            print(json.dumps({"text": "", "seconds": 0, "busy": True}))
+            return 0
     stt = make_transcriber(cfg, args.whisper)
     if args.warm:
         stt.warm()

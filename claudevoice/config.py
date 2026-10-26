@@ -17,6 +17,7 @@ SERVER_LOG_PATH = CONFIG_DIR / "server.log"
 LISTEN_STOP_FLAG = CONFIG_DIR / "listen.stop"
 # ...and this one to finish a hold-mode recording and transcribe it.
 LISTEN_DONE_FLAG = CONFIG_DIR / "listen.done"
+LISTEN_LOCK = CONFIG_DIR / "listen.lock"  # only one microphone recording at a time
 
 DEFAULTS: dict = {
     # Kokoro voice. Blend voices by listing several, e.g. "af_heart,af_bella".

@@ -38,6 +38,41 @@ BLOCK = 1024  # frames per write; small so /stop takes effect within ~40 ms
 log = logging.getLogger("claudevoice.server")
 
 
+_COREAUDIO = None
+
+
+def default_output_id() -> int | None:
+    """The system default output device's ID on macOS (microseconds to read).
+
+    Returns None elsewhere, which makes the speaker reopen for every reply.
+    """
+    global _COREAUDIO
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        if _COREAUDIO is None:
+            _COREAUDIO = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+
+        class _Address(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32),
+                        ("element", ctypes.c_uint32)]
+
+        def fourcc(code: str) -> int:
+            return int.from_bytes(code.encode(), "big")
+
+        address = _Address(fourcc("dOut"), fourcc("glob"), 0)
+        device = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(device))
+        status = _COREAUDIO.AudioObjectGetPropertyData(
+            1, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(device))
+        return int(device.value) if status == 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class Speaker:
     """Owns the Kokoro pipeline, a synthesis queue, and the audio output stream."""
 
@@ -51,6 +86,7 @@ class Speaker:
         self._lock = threading.Lock()
         self.pipeline = None
         self.last_error = ""
+        self.output_device = ""
         self._worker = threading.Thread(target=self._run, name="kokoro-worker", daemon=True)
 
     def start(self) -> None:
@@ -88,6 +124,7 @@ class Speaker:
         chunks = split_sentences(text) if engine == "kokoro" else ([text.strip()] if text.strip() else [])
         if not chunks:
             return 0
+        log.info("speak %d chars as %s:%s", len(text), engine, voice)
         self._idle.clear()
         for chunk in chunks:
             self._queue.put((gen, chunk, f"{engine}:{voice}", speed))
@@ -164,22 +201,67 @@ class Speaker:
             pcm = resp.read()
         return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
-    def _run(self) -> None:
+    def _open_stream(self):
+        """Open the speaker on the CURRENT system default output.
+
+        PortAudio snapshots the device list when it starts, so a long-running
+        server would keep playing into whatever was the default back then (laptop
+        speakers after headphones were plugged in, a monitor that went away...).
+        Re-initialising first makes the new stream follow the device the user hears now.
+        """
         import sounddevice as sd
 
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception:  # noqa: BLE001 - fall back to the existing device list
+            log.exception("could not refresh the audio device list")
         stream = sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=BLOCK)
         stream.start()
+        try:
+            name = sd.query_devices(stream.device)["name"]
+        except Exception:  # noqa: BLE001
+            name = str(stream.device)
+        self.output_device = name
+        log.info("playing on %s", name)
+        return stream
+
+    def _run(self) -> None:
+        stream = None
+        stream_output = None  # the system default output the stream was opened on
+        was_idle = True
         while True:
             try:
                 gen, chunk, voice, speed = self._queue.get(timeout=0.1)
             except queue.Empty:
                 if self._queue.empty():
                     self._idle.set()
+                    was_idle = True
                 continue
             with self._lock:
                 if gen != self._generation:
                     continue  # cancelled by /stop while waiting in the queue
                 self._stop_playback.clear()
+            if was_idle:
+                # A new reply: make sure we play where the user is listening now.
+                # Opening a Bluetooth stream costs ~0.6 s, so reuse it when the default is unchanged.
+                was_idle = False
+                current = default_output_id()
+                if stream is not None and (current is None or current != stream_output):
+                    try:
+                        stream.stop()
+                        stream.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    stream = None
+                if stream is None:
+                    try:
+                        stream = self._open_stream()
+                        stream_output = default_output_id()
+                    except Exception as exc:  # noqa: BLE001 - keep the worker alive
+                        self.last_error = f"could not open the speaker: {exc}"
+                        log.exception(self.last_error)
+                        continue
             try:
                 for audio in self._generate(chunk, voice, speed):
                     if self._play(audio, stream):
@@ -278,7 +360,8 @@ def make_handler(speaker: Speaker, cfg: dict):
             if self.path == "/health":
                 live = config.load()
                 self._json(200, {"ok": True, "speaking": speaker.speaking, "voice": live["voice"],
-                                 "engine": live.get("tts_engine", "kokoro"), "last_error": speaker.last_error})
+                                 "engine": live.get("tts_engine", "kokoro"), "last_error": speaker.last_error,
+                                 "output_device": speaker.output_device})
             else:
                 self._json(404, {"error": "not found"})
 
