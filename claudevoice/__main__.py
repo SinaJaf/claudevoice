@@ -16,6 +16,7 @@ USAGE = """claudevoice <command>
   say "text" [--voice V]         speak text through the server (starts it if needed)
   stop                           cut off whatever is playing
   voices                         list the English Kokoro voices
+  devices                        list microphones (pick one with: config input_device NAME)
   config [key value]             show or set a setting in ~/.claudevoice/config.json
 """
 
@@ -81,6 +82,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if cmd == "stop":
         client.stop()
+        return 0
+    if cmd == "devices":
+        from .record import input_devices
+
+        for d in input_devices():
+            print(("* " if d["default"] else "  ") + d["name"])
         return 0
     if cmd == "voices":
         for group, names in VOICES.items():

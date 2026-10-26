@@ -186,15 +186,33 @@ async function listenOnce($: Engine): Promise<void> {
   }
   let text = ''
   let cancelled = false
+  let silent = false
+  let device = ''
   try {
-    const parsed = JSON.parse(ran.stdout.trim().split('\n').pop() ?? '{}') as { text?: string; cancelled?: boolean }
+    const parsed = JSON.parse(ran.stdout.trim().split('\n').pop() ?? '{}') as {
+      text?: string; cancelled?: boolean; silent?: boolean; device?: string
+    }
     text = (parsed.text ?? '').trim()
     cancelled = parsed.cancelled === true
+    silent = parsed.silent === true
+    device = parsed.device ?? ''
   } catch {
     text = ''
   }
   if (cancelled) return
+  if (silent) {
+    // The input carried no signal at all: unplugged, lid closed, or no permission.
+    const why = `The microphone "${device}" is giving silence. Check it is connected and allowed, or pick another one in the voice settings.`
+    await endCall($, why)
+    $.ui.toast(why)
+    if (await speak($, 'I cannot hear anything from the microphone. Please check it, or choose another one in the voice settings.')) {
+      await update($, phase, () => 'speaking')
+      watchPlayback($)
+    }
+    return
+  }
   if (text === '') {
+    if ((await read($, mode)) === 'hold') $.ui.toast("I didn't catch any words; still listening")
     void listenOnce($) // silence or noise: keep listening
     return
   }
@@ -272,7 +290,8 @@ function shortWhisper(name: string): string {
 }
 
 async function loadSettings($: Engine): Promise<VoiceSettings> {
-  const ran = await $.process.run([...(await python($)), '-m', 'claudevoice', 'config'], { cwd: root($), timeoutMs: 60000 })
+  const py = await python($)
+  const ran = await $.process.run([...py, '-m', 'claudevoice', 'config'], { cwd: root($), timeoutMs: 60000 })
   let parsed: Record<string, unknown> = {}
   try {
     parsed = JSON.parse(ran.stdout) as Record<string, unknown>
@@ -281,6 +300,14 @@ async function loadSettings($: Engine): Promise<VoiceSettings> {
   }
   const flat: VoiceSettings = {}
   for (const [k, v] of Object.entries(parsed)) flat[k] = String(v)
+  // The microphones on this machine, newline-separated; the default one first.
+  const mics = await $.process.run([...py, '-m', 'claudevoice.listen', '--devices'], { cwd: root($), timeoutMs: 60000 })
+  try {
+    const list = JSON.parse(mics.stdout.trim().split('\n').pop() ?? '[]') as { name: string; default: boolean }[]
+    flat._microphones = list.map(d => (d.default ? `${d.name}\t(system default)` : d.name)).join('\n')
+  } catch {
+    flat._microphones = ''
+  }
   await update($, settings, () => flat)
   return flat
 }
@@ -484,6 +511,19 @@ async function settingsPane($: Engine, e: Surface) {
       />
       <Box marginTop={1}><Text>Listening (speech to text)</Text></Box>
       <Select key="listening" options={listening} value={listeningValue(s)} onSelect={(v: string) => void pickListening($, v)} />
+      <Box marginTop={1}><Text>Microphone</Text></Box>
+      <Select
+        key="microphone"
+        options={[
+          { value: '', label: 'System default' },
+          ...(s._microphones ?? '').split('\n').filter(x => x !== '').map(line => {
+            const [name, tag] = line.split('\t') as [string, string | undefined]
+            return { value: name, label: tag ? `${name} ${tag}` : name }
+          }),
+        ]}
+        value={s.input_device ?? ''}
+        onSelect={(v: string) => void setSetting($, 'input_device', v)}
+      />
       <Box marginTop={1}><Text>Speaking (text to speech)</Text></Box>
       <Select key="speaking" options={speaking} value={speakingValue(s)} onSelect={(v: string) => void pickSpeaking($, v)} />
       <Box marginTop={1}><Text>Speed</Text></Box>

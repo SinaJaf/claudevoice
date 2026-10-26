@@ -52,6 +52,8 @@ DEFAULTS: dict = {
     "vad_threshold": 0.012,
     # Longest single recording, in seconds.
     "max_record_seconds": 90,
+    # Microphone by name (as `claudevoice devices` lists them); empty = the system default.
+    "input_device": "",
 }
 
 

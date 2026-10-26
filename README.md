@@ -16,7 +16,7 @@ Auto · Read aloud · ⚙ · ● Call          ← in the prompt footer, under t
 - **Hold mode** (default): pause and think as long as you like, press **Done** when you've finished.
   **Auto mode**: a one-second pause sends what you said.
 - **⚙**: the plugin on/off switch, the listening engine (local Whisper in four sizes, or OpenAI's
-  cloud transcription), the speaking engine (Kokoro voices, OpenAI voices, ElevenLabs), speed, and
+  cloud transcription), the microphone, the speaking engine (Kokoro voices, OpenAI voices, ElevenLabs), speed, and
   hold/auto. Changes apply immediately. Off leaves only the gear, so you can turn it back on.
 
 ## Install
@@ -79,6 +79,7 @@ The gear covers the common ones. Everything is in `~/.claudevoice/config.json`, 
 | `stt_model`, `stt_base_url`, `stt_api_key_env` | OpenAI defaults | cloud transcription |
 | `tts_engine` | `kokoro` | `kokoro`, `openai`, `elevenlabs` |
 | `tts_voice`, `tts_model`, `tts_base_url`, `tts_api_key_env` | OpenAI defaults | cloud speech (ElevenLabs voice id goes in `tts_voice`) |
+| `input_device` | `` (system default) | microphone name, as `claudevoice devices` lists them |
 | `silence_seconds` | `1.2` | pause that ends a recording in auto mode |
 | `vad_threshold` | `0.012` | mic energy that counts as speech; raise in noisy rooms |
 | `max_chars` | `2500` | longest reply read in full |
@@ -107,6 +108,9 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 ## Troubleshooting
 
 - Logs: `~/.claudevoice/server.log` (speech) and `~/.claudevoice/claudevoice.log` (hooks).
+- "The microphone is giving silence": the input carries no signal at all. A MacBook's built-in mic
+  is muted with the lid closed, an unplugged USB mic falls back to it, and macOS may not have granted
+  the app microphone access. Pick another microphone in the gear, or `claudevoice devices`.
 - Silent after picking a cloud voice: the key isn't visible to the server. Export it in your shell
   profile and run `claudevoice stop-server` (it restarts on the next use).
 - spaCy error "Python int too large to convert to C ssize_t": `preshed` must stay pinned to 3.0.10.
