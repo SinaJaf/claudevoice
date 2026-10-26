@@ -41,29 +41,101 @@ def device_name(index: int | None) -> str:
         return "default input"
 
 
+class _Mic:
+    """One input stream that reopens itself when the device situation changes.
+
+    It follows the system default input unless a preferred microphone is set
+    and present. It reopens when the system default changes (while following
+    it), or when the stream dies or stops delivering audio (device unplugged).
+    """
+
+    STALL_SECONDS = 1.5
+
+    def __init__(self, preference: str, block: int, q: "queue.Queue[np.ndarray]") -> None:
+        self.preference = preference
+        self.block = block
+        self.q = q
+        self.stream = None
+        self.name = "default input"
+        self.following_default = True
+        self.default_id: int | None = None
+        self.last_data = time.time()
+        self.last_check = 0.0
+
+    def _callback(self, indata, frames, t, status):  # noqa: ARG002
+        self.last_data = time.time()
+        self.q.put(indata[:, 0].copy())
+
+    def open(self, refresh: bool) -> None:
+        import sounddevice as sd
+
+        from . import devices
+
+        if refresh:
+            devices.refresh()
+        index = resolve_device(self.preference)
+        self.following_default = index is None
+        self.default_id = devices.default_input_id()
+        self.stream = sd.InputStream(samplerate=MIC_RATE, channels=1, dtype="float32",
+                                     blocksize=self.block, callback=self._callback, device=index)
+        self.stream.start()
+        self.name = device_name(index)
+        self.last_data = time.time()
+
+    def close(self) -> None:
+        if self.stream is None:
+            return
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.stream = None
+
+    def needs_reopen(self, now: float) -> bool:
+        from . import devices
+
+        if self.stream is None or not self.stream.active:
+            return True
+        if now - self.last_data > self.STALL_SECONDS:
+            return True  # no audio arriving: the device went away
+        if now - self.last_check >= 0.25:
+            self.last_check = now
+            if self.following_default:
+                current = devices.default_input_id()
+                if current is not None and current != self.default_id:
+                    return True
+        return False
+
+    def reopen(self) -> None:
+        self.close()
+        try:
+            self.open(refresh=True)
+        except Exception:  # noqa: BLE001 - try again on the next tick
+            self.stream = None
+            self.last_data = time.time()
+
+
 def record(*, silence_seconds: float, threshold: float, max_seconds: float,
            stop_event: threading.Event | None = None,
-           on_level=None, device: int | None = None) -> np.ndarray:
-    """Record from the default microphone until the speaker goes quiet.
+           on_level=None, device: str = "", info: dict | None = None) -> np.ndarray:
+    """Record from the microphone until the speaker goes quiet.
 
-    Recording ends when `silence_seconds` of quiet follow detected speech, when
-    `stop_event` is set (e.g. the user pressed Enter), or at `max_seconds`.
-    Returns float32 mono audio at 16 kHz.
+    `device` names a preferred microphone; empty (or absent) follows the system
+    default, switching mid-recording when the default changes. Recording ends
+    when `silence_seconds` of quiet follow detected speech, when `stop_event` is
+    set (e.g. the user pressed Done), or at `max_seconds`. Returns float32 mono
+    audio at 16 kHz; `info["device"]` receives the microphone used last.
     """
-    import sounddevice as sd
-
     q: "queue.Queue[np.ndarray]" = queue.Queue()
-
-    def callback(indata, frames, t, status):  # noqa: ARG001
-        q.put(indata[:, 0].copy())
-
     chunks: list[np.ndarray] = []
     heard_speech = False
     last_voice = time.time()
     started = time.time()
     block = int(MIC_RATE * 0.05)  # 50 ms blocks
-    with sd.InputStream(samplerate=MIC_RATE, channels=1, dtype="float32", blocksize=block, callback=callback,
-                        device=device):
+    mic = _Mic(device, block, q)
+    mic.open(refresh=False)
+    try:
         while True:
             try:
                 data = q.get(timeout=0.2)
@@ -84,6 +156,12 @@ def record(*, silence_seconds: float, threshold: float, max_seconds: float,
                 break
             if now - started >= max_seconds:
                 break
+            if mic.needs_reopen(now):
+                mic.reopen()
+    finally:
+        mic.close()
+        if info is not None:
+            info["device"] = mic.name
     if not chunks:
         return np.zeros(0, dtype=np.float32)
     audio = np.concatenate(chunks)

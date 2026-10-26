@@ -13,11 +13,17 @@ Auto · Read aloud · ⚙ · ● Call          ← in the prompt footer, under t
 - **● Call**: a spoken conversation inside the current session. Claude listens, sends what you
   said as the next prompt, reads the answer aloud, then listens again. **Talk now** interrupts
   Claude mid-sentence; **End call** hangs up and never cancels work Claude is doing.
-- **Hold mode** (default): pause and think as long as you like, press **Done** when you've finished.
-  **Auto mode**: a one-second pause sends what you said.
+- **Hold mode** (default): pause and think as long as you like, press **Done** when you've finished. There is no
+  time limit; nothing is sent until you press Done. **Auto mode**: a one-second pause sends what you said.
+- **Mute mic** during a call: recording stops at once, the unfinished take is thrown away, and nothing is
+  recorded or sent until you press **Unmute mic**.
+- Switch headphones, speakers or microphones whenever you like: replies follow the system's current output
+  (from the next sentence), and recording follows the system's current input, even mid-sentence.
 - **⚙**: the plugin on/off switch, the listening engine (local Whisper in four sizes, or OpenAI's
   cloud transcription), the microphone, the speaking engine (Kokoro voices, OpenAI voices, ElevenLabs), speed, and
   hold/auto. Changes apply immediately. Off leaves only the gear, so you can turn it back on.
+- **Per-chat settings**: under each setting in the gear, open **▸ this chat** to choose a different value for the
+  chat you're in. Pick **Same as all chats** to go back to the shared setting.
 
 ## Install
 
@@ -79,7 +85,7 @@ The gear covers the common ones. Everything is in `~/.claudevoice/config.json`, 
 | `stt_model`, `stt_base_url`, `stt_api_key_env` | OpenAI defaults | cloud transcription |
 | `tts_engine` | `kokoro` | `kokoro`, `openai`, `elevenlabs` |
 | `tts_voice`, `tts_model`, `tts_base_url`, `tts_api_key_env` | OpenAI defaults | cloud speech (ElevenLabs voice id goes in `tts_voice`) |
-| `input_device` | `` (system default) | microphone name, as `claudevoice devices` lists them |
+| `input_device` | `` (system default) | microphone name, as `claudevoice devices` lists them; empty follows the system's input as it changes, and a named mic that is unplugged falls back to it |
 | `silence_seconds` | `1.2` | pause that ends a recording in auto mode |
 | `vad_threshold` | `0.012` | mic energy that counts as speech; raise in noisy rooms |
 | `max_chars` | `2500` | longest reply read in full |

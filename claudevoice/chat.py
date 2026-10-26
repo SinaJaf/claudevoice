@@ -235,7 +235,8 @@ def _listen(keys: KeyReader, stt, cfg: dict) -> str:
         status(f"{RED}● listening{RESET} {bars[idx]} {DIM}{'(speak…)' if not heard else '(pause to send)'}{RESET}")
 
     audio = record(silence_seconds=cfg["silence_seconds"], threshold=cfg["vad_threshold"],
-                   max_seconds=cfg["max_record_seconds"], stop_event=stop_event, on_level=on_level)
+                   max_seconds=cfg["max_record_seconds"], stop_event=stop_event, on_level=on_level,
+                   device=cfg.get("input_device", ""))
     stop_event.set()
     t.join(timeout=0.5)
     status(f"{YELLOW}transcribing…{RESET}")

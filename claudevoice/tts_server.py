@@ -29,48 +29,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 
-from . import config
+from . import config, devices
 from .clean import markdown_to_speech, split_sentences
 
 SAMPLE_RATE = 24_000
 BLOCK = 1024  # frames per write; small so /stop takes effect within ~40 ms
 
 log = logging.getLogger("claudevoice.server")
-
-
-_COREAUDIO = None
-
-
-def default_output_id() -> int | None:
-    """The system default output device's ID on macOS (microseconds to read).
-
-    Returns None elsewhere, which makes the speaker reopen for every reply.
-    """
-    global _COREAUDIO
-    if sys.platform != "darwin":
-        return None
-    try:
-        import ctypes
-        import ctypes.util
-
-        if _COREAUDIO is None:
-            _COREAUDIO = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
-
-        class _Address(ctypes.Structure):
-            _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32),
-                        ("element", ctypes.c_uint32)]
-
-        def fourcc(code: str) -> int:
-            return int.from_bytes(code.encode(), "big")
-
-        address = _Address(fourcc("dOut"), fourcc("glob"), 0)
-        device = ctypes.c_uint32(0)
-        size = ctypes.c_uint32(ctypes.sizeof(device))
-        status = _COREAUDIO.AudioObjectGetPropertyData(
-            1, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(device))
-        return int(device.value) if status == 0 else None
-    except Exception:  # noqa: BLE001
-        return None
 
 
 class Speaker:
@@ -87,6 +52,9 @@ class Speaker:
         self.pipeline = None
         self.last_error = ""
         self.output_device = ""
+        self._stream = None
+        self._stream_output: int | None = None
+        self._last_device_check = 0.0
         self._worker = threading.Thread(target=self._run, name="kokoro-worker", daemon=True)
 
     def start(self) -> None:
@@ -201,34 +169,61 @@ class Speaker:
             pcm = resp.read()
         return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
-    def _open_stream(self):
-        """Open the speaker on the CURRENT system default output.
+    # -- the speaker device ----------------------------------------------------
+    # The stream follows the system default output: it reopens when the default
+    # changes (checked before each sentence and about twice a second while
+    # playing), and when a write fails because the device went away.
+    # Opening a Bluetooth stream costs ~0.6 s, so an unchanged default is reused.
 
-        PortAudio snapshots the device list when it starts, so a long-running
-        server would keep playing into whatever was the default back then (laptop
-        speakers after headphones were plugged in, a monitor that went away...).
-        Re-initialising first makes the new stream follow the device the user hears now.
-        """
+    def _open_stream(self) -> None:
         import sounddevice as sd
 
-        try:
-            sd._terminate()
-            sd._initialize()
-        except Exception:  # noqa: BLE001 - fall back to the existing device list
-            log.exception("could not refresh the audio device list")
+        self._close_stream()
+        devices.refresh()  # see newly plugged / newly default devices
         stream = sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=BLOCK)
         stream.start()
         try:
             name = sd.query_devices(stream.device)["name"]
         except Exception:  # noqa: BLE001
             name = str(stream.device)
+        self._stream = stream
+        self._stream_output = devices.default_output_id()
         self.output_device = name
         log.info("playing on %s", name)
-        return stream
+
+    def _close_stream(self) -> None:
+        if self._stream is None:
+            return
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._stream = None
+
+    def _ensure_stream(self, new_reply: bool = False) -> None:
+        self._last_device_check = time.time()
+        current = devices.default_output_id()
+        if self._stream is None:
+            self._open_stream()
+        elif current is None:
+            # No cheap way to see the default here (not macOS): reopen per reply.
+            if new_reply:
+                self._open_stream()
+        elif current != self._stream_output:
+            self._open_stream()
+
+    def _write(self, block: np.ndarray) -> None:
+        if time.time() - self._last_device_check > 0.5:
+            self._ensure_stream()
+        try:
+            self._stream.write(block)
+        except Exception:  # noqa: BLE001 - device unplugged mid-write: reopen once
+            log.warning("speaker write failed; reopening on the current default output")
+            self._open_stream()
+            self._stream.write(block)
 
     def _run(self) -> None:
-        stream = None
-        stream_output = None  # the system default output the stream was opened on
         was_idle = True
         while True:
             try:
@@ -242,45 +237,37 @@ class Speaker:
                 if gen != self._generation:
                     continue  # cancelled by /stop while waiting in the queue
                 self._stop_playback.clear()
-            if was_idle:
-                # A new reply: make sure we play where the user is listening now.
-                # Opening a Bluetooth stream costs ~0.6 s, so reuse it when the default is unchanged.
+            try:
+                self._ensure_stream(new_reply=was_idle)
                 was_idle = False
-                current = default_output_id()
-                if stream is not None and (current is None or current != stream_output):
-                    try:
-                        stream.stop()
-                        stream.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    stream = None
-                if stream is None:
-                    try:
-                        stream = self._open_stream()
-                        stream_output = default_output_id()
-                    except Exception as exc:  # noqa: BLE001 - keep the worker alive
-                        self.last_error = f"could not open the speaker: {exc}"
-                        log.exception(self.last_error)
-                        continue
+            except Exception as exc:  # noqa: BLE001 - keep the worker alive
+                self.last_error = f"could not open the speaker: {exc}"
+                log.exception(self.last_error)
+                self._stream = None
+                continue
             try:
                 for audio in self._generate(chunk, voice, speed):
-                    if self._play(audio, stream):
+                    if self._play(audio):
                         break
                 self.last_error = ""
             except urllib.error.HTTPError as exc:
                 detail = exc.read()[:200].decode(errors="ignore")
                 self.last_error = f"{voice.split(':')[0]} speech failed: HTTP {exc.code} {detail}"
                 log.error(self.last_error)
-                self._fallback(chunk, voice, speed, stream)
+                self._fallback(chunk, voice, speed)
             except Exception as exc:  # noqa: BLE001 - keep the worker alive
                 self.last_error = f"{voice.split(':')[0]} speech failed: {exc}"
                 log.exception("synthesis failed for chunk: %r", chunk[:80])
-                self._fallback(chunk, voice, speed, stream)
+                self._fallback(chunk, voice, speed)
             # Tiny pause between sentences reads more naturally than butting them together.
             if not self._stop_playback.is_set():
-                stream.write(np.zeros(int(SAMPLE_RATE * 0.12), dtype=np.float32))
+                try:
+                    self._write(np.zeros(int(SAMPLE_RATE * 0.12), dtype=np.float32))
+                except Exception:  # noqa: BLE001
+                    log.exception("speaker unavailable")
+                    self._stream = None
 
-    def _fallback(self, chunk: str, engine_voice: str, speed: float, stream) -> None:
+    def _fallback(self, chunk: str, engine_voice: str, speed: float) -> None:
         """A cloud engine failed: say why with Kokoro, then read the text with Kokoro."""
         engine = engine_voice.split(":")[0]
         if engine == "kokoro":
@@ -290,17 +277,17 @@ class Speaker:
         try:
             for text in (notice, chunk):
                 for audio in self._generate(text, f"kokoro:{self.cfg['voice']}", speed):
-                    if self._play(audio, stream):
+                    if self._play(audio):
                         return
         except Exception:  # noqa: BLE001
             log.exception("kokoro fallback failed")
 
-    def _play(self, audio: np.ndarray, stream) -> bool:
+    def _play(self, audio: np.ndarray) -> bool:
         """Write audio in small blocks; returns True if interrupted."""
         for i in range(0, len(audio), BLOCK):
             if self._stop_playback.is_set():
                 return True
-            stream.write(np.ascontiguousarray(audio[i : i + BLOCK]))
+            self._write(np.ascontiguousarray(audio[i : i + BLOCK]))
         return False
 
 
