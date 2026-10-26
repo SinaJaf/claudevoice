@@ -15,6 +15,7 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], state: { speaking:
   const runs: string[][] = []
   const submitted: string[] = []
   const written: string[] = []
+  const writes: { path: string; content: string }[] = []
   const opened: string[] = []
   on('command.register', () => ({ value: { command: 'voice-panel' } }))
   on('ui.open', (_, e) => {
@@ -64,9 +65,10 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], state: { speaking:
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/tester' : undefined }))
   on('fs.write', (_, e) => {
     written.push(e.path)
+    writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, opened }
+  return { fetches, runs, submitted, written, writes, opened }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -213,7 +215,7 @@ test('Switched off, only the gear stays; switched on, the controls return', asyn
   await footer.unmount()
 })
 
-test('Mute stops recording and nothing is sent until unmuted', async ($, on) => {
+test('Mute pauses the microphone and keeps the take; Done still sends it', async ($, on) => {
   const state = { speaking: false }
   const w = world(on, state)
   const clock = mock.clock(on)
@@ -221,20 +223,21 @@ test('Mute stops recording and nothing is sent until unmuted', async ($, on) => 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   await ui.press({ key: 'call' })
+  expect(w.writes.some(x => x.path.endsWith('listen.mute') && x.content === '0')).toBe(true)
 
-  // Muted during the greeting: when it ends, no listener starts and nothing is sent.
-  await ui.press({ key: 'mute' })
-  expect(await ui.find({ type: 'Button', text: /Unmute mic/ })).toBeDefined()
+  // Greeting ends, the take begins; muting writes the flag and never cancels the take.
   state.speaking = false
   await clock.advance(400)
-  expect(await ui.find({ type: 'Text', text: /mic muted/ })).toBeDefined()
-  expect(w.runs.some(argv => argv.includes('claudevoice.listen') && !argv.includes('--warm'))).toBe(false)
-  expect(w.submitted).toEqual([])
-
-  // Unmuted: listening resumes and what was said is sent.
   await ui.press({ key: 'mute' })
+  expect(w.writes.some(x => x.path.endsWith('listen.mute') && x.content === '1')).toBe(true)
+  expect(w.written.some(p => p.endsWith('listen.stop'))).toBe(false)
+  expect(await ui.find({ type: 'Text', text: /mic muted/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', text: /Unmute mic/ })).toBeDefined()
+
+  // Unmuted: the same take carries on, and its words are sent.
+  await ui.press({ key: 'mute' })
+  expect(w.writes.filter(x => x.path.endsWith('listen.mute')).pop()?.content).toBe('0')
   await clock.advance(400)
-  expect(w.runs.some(argv => argv.includes('claudevoice.listen') && !argv.includes('--warm'))).toBe(true)
   expect(w.submitted).toEqual(['what time is it'])
   expect(await ui.find({ type: 'Button', text: /Mute mic/ })).toBeDefined()
   await ui.unmount()

@@ -118,7 +118,8 @@ class _Mic:
 
 def record(*, silence_seconds: float, threshold: float, max_seconds: float,
            stop_event: threading.Event | None = None,
-           on_level=None, device: str = "", info: dict | None = None) -> np.ndarray:
+           on_level=None, device: str = "", info: dict | None = None,
+           paused=None) -> np.ndarray:
     """Record from the microphone until the speaker goes quiet.
 
     `device` names a preferred microphone; empty (or absent) follows the system
@@ -126,6 +127,8 @@ def record(*, silence_seconds: float, threshold: float, max_seconds: float,
     when `silence_seconds` of quiet follow detected speech, when `stop_event` is
     set (e.g. the user pressed Done), or at `max_seconds`. Returns float32 mono
     audio at 16 kHz; `info["device"]` receives the microphone used last.
+    While `paused()` is true (the mic is muted) incoming audio is dropped and
+    the take stays open; what was said before the mute is kept.
     """
     q: "queue.Queue[np.ndarray]" = queue.Queue()
     chunks: list[np.ndarray] = []
@@ -133,6 +136,8 @@ def record(*, silence_seconds: float, threshold: float, max_seconds: float,
     last_voice = time.time()
     started = time.time()
     block = int(MIC_RATE * 0.05)  # 50 ms blocks
+    ended_by_silence = False
+    was_paused = False
     mic = _Mic(device, block, q)
     mic.open(refresh=False)
     try:
@@ -142,6 +147,13 @@ def record(*, silence_seconds: float, threshold: float, max_seconds: float,
             except queue.Empty:
                 data = None
             now = time.time()
+            is_paused = bool(paused and paused())
+            if is_paused:
+                data = None  # muted: record nothing
+                was_paused = True
+            elif was_paused:
+                was_paused = False
+                last_voice = now  # a pause while muted is not the end of the take
             if data is not None:
                 chunks.append(data)
                 level = float(np.sqrt(np.mean(data ** 2)))
@@ -152,7 +164,8 @@ def record(*, silence_seconds: float, threshold: float, max_seconds: float,
                     last_voice = now
             if stop_event is not None and stop_event.is_set():
                 break
-            if heard_speech and now - last_voice >= silence_seconds:
+            if not is_paused and heard_speech and now - last_voice >= silence_seconds:
+                ended_by_silence = True
                 break
             if now - started >= max_seconds:
                 break
@@ -165,6 +178,8 @@ def record(*, silence_seconds: float, threshold: float, max_seconds: float,
     if not chunks:
         return np.zeros(0, dtype=np.float32)
     audio = np.concatenate(chunks)
-    # Trim trailing silence so Whisper doesn't hallucinate on it.
+    if not ended_by_silence:
+        return audio  # ended by Done or the cap: the last words may be right at the end
+    # A pause ended the take: trim that trailing silence so Whisper doesn't hallucinate on it.
     keep = len(audio) - int(max(0.0, min(silence_seconds, 2.0) - 0.3) * MIC_RATE)
-    return audio[: max(keep, 0)] if heard_speech else audio
+    return audio[: max(keep, 0)]

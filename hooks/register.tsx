@@ -232,11 +232,7 @@ function watchPlayback($: Engine): void {
 /** Record one utterance (until a pause, or until Done in hold mode), transcribe, send. */
 async function listenOnce($: Engine): Promise<void> {
   if (!(await read($, isCall))) return
-  if (await read($, muted)) {
-    await update($, phase, () => 'idle') // Unmute starts listening again
-    return
-  }
-  await update($, phase, () => 'listening')
+  await update($, phase, () => 'listening') // while muted the listener records nothing
   // The listener runs detached and leaves its answer in a file of its own, so a
   // hold-mode take lasts until Done, beyond the 10-minute limit on a plugin command.
   const session = (await $.session.id()).replace(/[^A-Za-z0-9_-]/g, '')
@@ -274,7 +270,6 @@ function awaitTake($: Engine, resultPath: string): void {
 
 async function handleTake($: Engine, raw: string): Promise<void> {
   if (!(await read($, isCall))) return
-  if (await read($, muted)) return // muted while recording: drop what was captured
   let text = ''
   let cancelled = false
   let silent = false
@@ -326,6 +321,7 @@ async function startCall($: Engine): Promise<void> {
   if (await read($, isCall)) return
   await update($, isCall, () => true)
   await update($, muted, () => false)
+  await setMuteFlag($, false)
   await update($, note, () => '')
   await update($, phase, () => 'loading')
   if (!(await ensureServer($))) {
@@ -348,24 +344,26 @@ async function startCall($: Engine): Promise<void> {
 async function endCall($: Engine, reason: string): Promise<void> {
   await update($, isCall, () => false)
   await update($, muted, () => false)
+  await setMuteFlag($, false)
   await update($, phase, () => 'idle')
   await update($, note, () => reason)
   await touch($, await flagPath($, 'listen.stop'))
   await stopSpeaking($)
 }
 
-/** Mute: stop recording at once (the take is discarded) and record nothing until unmuted. */
+/** Mute pauses the microphone: nothing is recorded while muted, but what you said
+ *  before muting is kept, and Done still sends it. Unmute carries on the same take. */
 async function toggleMute($: Engine): Promise<void> {
-  if (await read($, muted)) {
-    await update($, muted, () => false)
-    // Nothing is listening while muted; start again unless Claude is busy (it listens after).
-    if ((await read($, isCall)) && (await read($, phase)) === 'idle') void listenOnce($)
-    return
-  }
-  await update($, muted, () => true)
-  if ((await read($, phase)) === 'listening') {
-    await touch($, await flagPath($, 'listen.stop'))
-    await update($, phase, () => 'idle')
+  const next = !(await read($, muted))
+  await update($, muted, () => next)
+  await setMuteFlag($, next)
+}
+
+async function setMuteFlag($: Engine, on: boolean): Promise<void> {
+  try {
+    await $.fs.write(await flagPath($, 'listen.mute'), on ? '1' : '0')
+  } catch {
+    // no flag: the listener records as usual
   }
 }
 
@@ -493,7 +491,7 @@ async function controls($: Engine, e: Surface, compact: boolean) {
   const status: Record<VoicePhase, string> = {
     idle: inCall ? (isMuted ? 'mic muted' : 'on a call') : '',
     loading: 'loading voice…',
-    listening: listenMode === 'hold' ? '● listening, press Done when finished' : '● listening, pause to send',
+    listening: isMuted ? 'mic muted · Done sends what you said before muting' : listenMode === 'hold' ? '● listening, press Done when finished' : '● listening, pause to send',
     thinking: 'thinking…',
     speaking: '♪ speaking',
   }
@@ -520,7 +518,7 @@ async function controls($: Engine, e: Surface, compact: boolean) {
         <Text> </Text>
         <Button key="settings" label="⚙" hotkey="g" plain onPress={() => void openSettings($)} />
         <Text> </Text>
-        {inCall && current === 'listening' && listenMode === 'hold' && (
+        {inCall && current === 'listening' && (listenMode === 'hold' || isMuted) && (
           <Button key="done" label="Done" hotkey="d" variant="primary" onPress={() => void doneTalking($)} />
         )}
         {inCall && current === 'speaking' && (
@@ -569,7 +567,7 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   const status: Record<VoicePhase, string> = {
     idle: inCall && isMuted ? 'mic muted' : '',
     loading: 'loading voice…',
-    listening: listenMode === 'hold' ? '● listening · press Done when finished' : '● listening · pause to send',
+    listening: isMuted ? 'mic muted · Done sends what you said before muting' : listenMode === 'hold' ? '● listening · press Done when finished' : '● listening · pause to send',
     thinking: 'thinking…',
     speaking: '♪ speaking',
   }
@@ -587,7 +585,7 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
       {busy && sep}
       {gear}
       {sep}
-      {inCall && current === 'listening' && listenMode === 'hold' && (
+      {inCall && current === 'listening' && (listenMode === 'hold' || isMuted) && (
         <Button key="done" label="Done" plain hover={{ bold: true, scope: 'voice' }} onPress={() => void doneTalking($)} />
       )}
       {inCall && current === 'speaking' && (

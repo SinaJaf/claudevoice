@@ -150,10 +150,20 @@ def _listen(argv: list[str], result_path: str | None) -> int:
     config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
     config.LISTEN_DONE_FLAG.unlink(missing_ok=True)
 
+    muted = threading.Event()
+
     def watch_flags() -> None:
         while not stop_event.is_set():
             if config.LISTEN_STOP_FLAG.exists() or config.LISTEN_DONE_FLAG.exists():
                 stop_event.set()
+            try:
+                is_muted = config.LISTEN_MUTE_FLAG.read_text().strip() == "1"
+            except OSError:
+                is_muted = False
+            if is_muted:
+                muted.set()
+            else:
+                muted.clear()
             time.sleep(0.1)
 
     threading.Thread(target=watch_flags, daemon=True).start()
@@ -164,7 +174,7 @@ def _listen(argv: list[str], result_path: str | None) -> int:
     used: dict = {}
     audio = record(silence_seconds=silence, threshold=cfg["vad_threshold"],
                    max_seconds=max_seconds, stop_event=stop_event,
-                   device=cfg.get("input_device", ""), info=used)
+                   device=cfg.get("input_device", ""), info=used, paused=muted.is_set)
     cancelled = config.LISTEN_STOP_FLAG.exists()
     stop_event.set()
     config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
