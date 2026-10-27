@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ChatSettings, VoicePhase, VoiceSettings } from '../types'
+import type { ChatSettings, ListenMode, Patience, VoicePhase, VoiceSettings } from '../types'
 
 const SERVER = 'http://127.0.0.1:8765'
 
@@ -22,6 +22,19 @@ const chatOpen = atom({ plugin: 'claudevoice', key: 'chatOpen' } as const, {} as
 const tick = atom({ plugin: 'claudevoice', key: 'tick' } as const, 0)
 /** In a call: the microphone records nothing until unmuted; what came before is kept. */
 const muted = atom({ plugin: 'claudevoice', key: 'muted' } as const, false)
+/** The result file of the listener now running ('' when none): one listener at a time. */
+const take = atom({ plugin: 'claudevoice', key: 'take' } as const, '')
+/** What the listener hears right now: waiting, hearing, pause, transcribing ('' when idle). */
+const hearing = atom({ plugin: 'claudevoice', key: 'hearing' } as const, '')
+/** live: Claude answers when you have finished talking; hold: when you press Done. */
+const listenMode = atom({ plugin: 'claudevoice', key: 'listenMode' } as const, 'live' as ListenMode)
+/** Live mode: talking while Claude speaks stops its voice. */
+const talkOver = atom({ plugin: 'claudevoice', key: 'talkOver' } as const, true)
+/** Live mode: how long a pause runs before Claude answers. */
+const patience = atom({ plugin: 'claudevoice', key: 'patience' } as const, 'normal' as Patience)
+const MODE_STORE_KEY = 'callMode'
+const TALK_OVER_STORE_KEY = 'talkOver'
+const PATIENCE_STORE_KEY = 'patience'
 const CHAT_STORE_PREFIX = 'chat:'
 const SAME_AS_ALL = '__all__'
 const ENABLED_STORE_KEY = 'enabled'
@@ -73,10 +86,23 @@ async function python($: Engine): Promise<string[]> {
   return (pythonArgv = [await uv($), 'run', '--quiet', '--project', r, 'python'])
 }
 
-/** First use on a machine: create the venv and pull the speech packages (a few minutes). */
+let synced = false
+
+/** First use on a machine: create the venv and pull the speech packages (a few minutes).
+ *  After an update, bring an existing venv in line with the lock once per load (quick
+ *  when nothing changed), so new engines find their packages. */
 async function ensurePython($: Engine): Promise<boolean> {
   const r = root($)
-  if ((await $.fs.exists(`${r}/.venv/bin/python`)) || (await $.fs.exists(`${r}/.venv/Scripts/python.exe`))) return true
+  if ((await $.fs.exists(`${r}/.venv/bin/python`)) || (await $.fs.exists(`${r}/.venv/Scripts/python.exe`))) {
+    if (!synced) {
+      synced = true
+      await update($, note, () => 'checking the voice engine…')
+      // --inexact keeps optional engines (Whisper) a user has added.
+      await $.process.run([await uv($), 'sync', '--project', r, '--quiet', '--inexact'], { cwd: r, timeoutMs: 600000 })
+      await update($, note, () => '')
+    }
+    return true
+  }
   await update($, note, () => 'installing the voice engine (first time only, a few minutes)…')
   const ran = await $.process.run([await uv($), 'sync', '--project', r], { cwd: r, timeoutMs: 600000 })
   await update($, note, () => '')
@@ -134,6 +160,28 @@ async function setChatSetting($: Engine, key: keyof ChatSettings, value: string)
   if (Object.keys(next).length === 0) await $.store.delete(storeKey)
   else await $.store.set(storeKey, next)
   if (key === 'plugin' && !(await isEnabled($))) await quiet($)
+  if (key === 'patience' || key === 'talkOver') await shareLiveSettings($)
+  if (key === 'listening' && value.startsWith('local:')) await ensureWhisper($)
+}
+
+async function modeHere($: Engine): Promise<ListenMode> {
+  const m = (await read($, chat)).listenMode ?? (await read($, listenMode))
+  return m === 'hold' ? 'hold' : 'live'
+}
+
+async function talkOverHere($: Engine): Promise<boolean> {
+  const c = await read($, chat)
+  return c.talkOver !== undefined ? c.talkOver === 'on' : read($, talkOver)
+}
+
+const PATIENCES: readonly Patience[] = ['short', 'normal', 'long', 'long2', 'long3', 'long4', 'long5', 'long6', 'long7', 'long8', 'long9', 'long10']
+
+function asPatience(value: unknown): Patience {
+  return PATIENCES.includes(value as Patience) ? (value as Patience) : 'normal'
+}
+
+async function patienceHere($: Engine): Promise<Patience> {
+  return asPatience((await read($, chat)).patience ?? (await read($, patience)))
 }
 
 /** Listener flags for this chat's listening engine and microphone, if it has its own. */
@@ -143,11 +191,18 @@ async function listenOverrides($: Engine): Promise<string[]> {
   if (c.listening !== undefined) {
     const [engine, model] = c.listening.split(':', 2) as [string, string]
     args.push(`--stt=${engine}`)
+    if (engine === 'parakeet') args.push(`--parakeet=${model}`)
     if (engine === 'local') args.push(`--whisper=${model}`)
     if (engine === 'openai') args.push(`--stt-model=${model}`)
   }
   if (c.microphone !== undefined) args.push(`--device=${c.microphone}`)
   return args
+}
+
+/** Tell the listener this chat's pause length and talk-over. A running listener re-reads
+ *  this file, so a change in the gear applies to the turn already listening. */
+async function shareLiveSettings($: Engine): Promise<void> {
+  await touch($, 'listen.settings', JSON.stringify({ patience: await patienceHere($), talk_over: await talkOverHere($) }))
 }
 
 async function touch($: Engine, name: string, text = ''): Promise<void> {
@@ -191,9 +246,10 @@ async function stopSpeaking($: Engine): Promise<void> {
 
 
 // ---- the features -----------------------------------------------------------------
-// A call is a back-and-forth: the plugin's own mic records you until you press Done
-// (pause and think as long as you like), the words go to Claude, Claude's reply is
-// read aloud, and the mic opens again by itself.
+// A call is a back-and-forth. Live mode (the default): the mic listens while Claude
+// talks too, so you can talk over it; your turn ends when Smart Turn hears you have
+// finished (or a long pause, or Done). Hold mode: the mic records until you press Done.
+// Either way your words go to Claude, its reply is read aloud, and the mic stays open.
 
 async function setPhase($: Engine, p: VoicePhase): Promise<void> {
   await update($, phase, () => p)
@@ -248,8 +304,12 @@ function watchPlayback($: Engine): void {
         await update($, note, () => h.last_error ?? '')
         $.ui.toast(h.last_error)
       }
-      if (await read($, isCall)) void listenOnce($)
-      else await setPhase($, 'idle')
+      if (!(await read($, isCall))) {
+        await setPhase($, 'idle')
+        return
+      }
+      await setPhase($, 'listening') // your turn
+      if ((await read($, take)) === '') void listenOnce($) // live mode is already listening
     })()
   })
 }
@@ -258,16 +318,24 @@ function watchPlayback($: Engine): void {
  *  file, so a take is not bound by the 10-minute limit on a plugin command. */
 async function listenOnce($: Engine): Promise<void> {
   if (!(await read($, isCall))) return
-  await setPhase($, 'listening')
+  if ((await read($, take)) !== '') return // one listener at a time, and it is already listening
+  // While Claude is still talking (live mode), the phase stays 'speaking' until it stops.
+  if ((await read($, phase)) !== 'speaking') await setPhase($, 'listening')
   const session = (await $.session.id()).replace(/[^A-Za-z0-9_-]/g, '')
   const resultPath = await flagPath($, `listen-${session}-${await $.clock.now()}.json`)
   // The heartbeat tells the listener someone is still waiting; it gives up if it goes stale.
   const heartbeat = await flagPath($, 'listen.alive')
   await touch($, 'listen.alive', String(await $.clock.now()))
+  const how = (await modeHere($)) === 'live'
+    ? ['--live', `--patience=${await patienceHere($)}`, (await talkOverHere($)) ? '--talk-over' : '--no-talk-over']
+    : ['--manual']
   const argv = [...(await python($)), '-m', 'claudevoice.listen', ...(await listenOverrides($)),
-    '--manual', '--result', resultPath, '--heartbeat', heartbeat, '--detach']
+    ...how, '--result', resultPath, '--heartbeat', heartbeat, '--detach']
+  await update($, take, () => resultPath)
+  await shareLiveSettings($)
   const ran = await $.process.run(argv, { cwd: root($), timeoutMs: 60000 })
   if (ran.exitCode !== 0) {
+    await update($, take, () => '')
     await endCall($, `listening failed: ${ran.stderr.trim().split('\n').pop() ?? 'unknown error'}`)
     return
   }
@@ -279,7 +347,9 @@ function awaitTake($: Engine, resultPath: string): void {
   $.clock.after(300, () => {
     void (async () => {
       if (!(await read($, isCall))) return // hung up: the listener was told to stop
+      if ((await read($, take)) !== resultPath) return // a newer listener took over
       await touch($, 'listen.alive', String(await $.clock.now()))
+      await followListener($)
       let raw = ''
       try {
         if (await $.fs.exists(resultPath)) raw = String(await $.fs.read(resultPath))
@@ -295,7 +365,22 @@ function awaitTake($: Engine, resultPath: string): void {
   })
 }
 
+/** Mirror what the listener hears (hearing you, writing...) in the footer. */
+async function followListener($: Engine): Promise<void> {
+  let state = ''
+  try {
+    const path = await flagPath($, 'listen.state')
+    if (await $.fs.exists(path)) state = String(await $.fs.read(path)).trim()
+  } catch {
+    state = ''
+  }
+  if (state !== (await read($, hearing))) await update($, hearing, () => state)
+  if (state === 'transcribing' && (await read($, phase)) === 'listening') await setPhase($, 'transcribing')
+}
+
 async function handleTake($: Engine, raw: string): Promise<void> {
+  await update($, take, () => '')
+  await update($, hearing, () => '')
   if (!(await read($, isCall))) return
   let parsed: { text?: string; cancelled?: boolean; silent?: boolean; busy?: boolean; device?: string; error?: string } = {}
   try {
@@ -323,7 +408,7 @@ async function handleTake($: Engine, raw: string): Promise<void> {
   }
   const text = (parsed.text ?? '').trim()
   if (text === '') {
-    $.ui.toast("I didn't catch any words; still listening")
+    if ((await modeHere($)) === 'hold') $.ui.toast("I didn't catch any words; still listening")
     void listenOnce($)
     return
   }
@@ -343,15 +428,23 @@ async function startCall($: Engine): Promise<void> {
     await endCall($, '')
     return
   }
-  // Loads the listening engine (and builds the Mac's speech helper the first time).
+  await ensurePython($)
+  // Loads the listening engine (downloads its model the first time, ~650 MB for Parakeet).
+  await update($, note, () => 'loading the listening model (a one-time download on first use)…')
   const warm = await $.process.run([...(await python($)), '-m', 'claudevoice.listen', ...(await listenOverrides($)), '--warm'], { cwd: root($), timeoutMs: 600000 })
+  await update($, note, () => '')
   if (warm.exitCode !== 0) {
     await endCall($, `could not start listening: ${warm.stderr.trim().split('\n').pop() ?? ''}`)
     return
   }
-  if (await speak($, "I'm listening. Take your time, and press Done when you've finished.")) {
+  const live = (await modeHere($)) === 'live'
+  const greeting = live
+    ? "I'm listening. Just talk, and I'll answer when you've finished."
+    : "I'm listening. Take your time, and press Done when you've finished."
+  if (await speak($, greeting)) {
     await setPhase($, 'speaking')
     watchPlayback($)
+    if (live) void listenOnce($) // live: the mic is open while Claude talks, for talk-over
   } else {
     void listenOnce($)
   }
@@ -360,6 +453,8 @@ async function startCall($: Engine): Promise<void> {
 /** Hang up: stop the mic and the voice. Never touches the work Claude is doing. */
 async function endCall($: Engine, reason: string): Promise<void> {
   await update($, isCall, () => false)
+  await update($, take, () => '')
+  await update($, hearing, () => '')
   await update($, muted, () => false)
   await touch($, 'listen.mute', '0')
   await setPhase($, 'idle')
@@ -391,6 +486,8 @@ async function stop($: Engine): Promise<void> {
 // ---- settings ----------------------------------------------------------------------
 
 const LISTENING: readonly [string, string][] = [
+  ['parakeet:v2', 'Parakeet, English (local, most accurate; default)'],
+  ['parakeet:v3', 'Parakeet, 25 European languages (local)'],
   ['apple:', "Mac's own speech recognition, on-device (macOS only)"],
   ['windows:', "Windows' own speech recognition, as in voice typing (Windows only)"],
   ['local:small', 'Local Whisper small (fast)'],
@@ -441,21 +538,37 @@ async function setSetting($: Engine, key: string, value: string): Promise<void> 
 
 async function openSettings($: Engine): Promise<void> {
   await loadSettings($)
-  await $.ui.open({ id: SETTINGS_PANE, title: 'Voice settings', focus: true, closeOnEscape: true, rows: 30 })
+  await $.ui.open({ id: SETTINGS_PANE, title: 'Voice settings', focus: true, closeOnEscape: true, rows: 40 })
 }
 
-/** "apple:", "windows:", "local:<size>" or "openai:<model>" from the config, and back. */
-function listeningValue(s: VoiceSettings, platform: string): string {
-  const system = platform === 'darwin' ? 'apple' : platform === 'win32' ? 'windows' : 'local'
-  const engine = s.stt_engine === 'auto' || s.stt_engine === undefined ? system : s.stt_engine
+/** "parakeet:<v>", "apple:", "windows:", "local:<size>" or "openai:<model>" from the config. */
+function listeningValue(s: VoiceSettings): string {
+  const engine = s.stt_engine === 'auto' || s.stt_engine === undefined ? 'parakeet' : s.stt_engine
+  if (engine === 'parakeet') return `parakeet:${s.parakeet_model ?? 'v2'}`
   if (engine === 'apple') return 'apple:'
   if (engine === 'windows') return 'windows:'
   if (engine === 'openai') return `openai:${s.stt_model ?? ''}`
   return `local:${(s.whisper_model ?? 'large-v3-turbo').replace(/^.*\/whisper-/, '').replace(/-mlx$/, '')}`
 }
+/** Whisper is an optional engine: install it the first time someone picks it. */
+async function ensureWhisper($: Engine): Promise<boolean> {
+  const r = root($)
+  await update($, note, () => 'installing Whisper (a few minutes the first time)…')
+  $.ui.toast('Installing Whisper, the optional listening engine…')
+  const ran = await $.process.run([await uv($), 'sync', '--project', r, '--quiet', '--inexact', '--extra', 'whisper'], { cwd: r, timeoutMs: 600000 })
+  await update($, note, () => '')
+  if (ran.exitCode !== 0) {
+    $.ui.toast(`Whisper could not be installed: ${ran.stderr.trim().split('\n').pop() ?? ''}`)
+    return false
+  }
+  return true
+}
+
 async function pickListening($: Engine, value: string): Promise<void> {
   const [engine, model] = value.split(':', 2) as [string, string]
+  if (engine === 'local' && !(await ensureWhisper($))) return
   await setSetting($, 'stt_engine', engine)
+  if (engine === 'parakeet') await setSetting($, 'parakeet_model', model)
   if (engine === 'local') await setSetting($, 'whisper_model', model)
   if (engine === 'openai') await setSetting($, 'stt_model', model)
 }
@@ -497,11 +610,16 @@ async function indicator($: Engine, e: Surface) {
   const current = await read($, phase)
   const t = await read($, tick)
   const isMuted = await read($, muted)
+  const heardNow = await read($, hearing)
   if (current === 'idle') return null
   const spin = SPINNER[t % SPINNER.length] ?? ''
   const [glyph, color, word] = {
     loading: [spin, 'claude', 'starting'],
-    listening: isMuted ? ['◌', 'warning', 'muted'] : [t % 2 === 0 ? '●' : '○', 'error', 'listening'],
+    listening: isMuted
+      ? ['◌', 'warning', 'muted']
+      : heardNow === 'hearing'
+        ? ['◉', 'success', 'hearing you']
+        : [t % 2 === 0 ? '●' : '○', 'error', 'listening'],
     transcribing: [spin, 'claude', 'writing'],
     thinking: [spin, 'claude', 'thinking'],
     speaking: [WAVE[t % WAVE.length] ?? '', 'claude', 'speaking'],
@@ -558,6 +676,7 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   const current = await read($, phase)
   const inCall = await read($, isCall)
   const isMuted = await read($, muted)
+  const micOpen = inCall && (await read($, take)) !== ''
   const quiet = { dimColor: true, hover: { dimColor: false, scope: 'voice' } } as const
   const lit = { hover: { bold: true, scope: 'voice' } } as const
   const items: JSX.Element[] = []
@@ -569,11 +688,11 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   if (modes.length > 0) add(<Text key="modes" dimColor>{modes.join(' & ')}</Text>)
   if (isOn) {
     if (!inCall) add(<Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />)
-    if (inCall && current === 'listening') {
-      add(<Button key="done" label="Done" plain {...lit} onPress={() => void done($)} />)
+    if (inCall && current === 'listening') add(<Button key="done" label="Done" plain {...lit} onPress={() => void done($)} />)
+    if (current === 'speaking') add(<Button key="stop" label="Stop" plain {...lit} onPress={() => void stop($)} />)
+    if (micOpen || (inCall && current === 'listening')) {
       add(<Button key="mute" label={isMuted ? 'Unmute' : 'Mute'} plain {...(isMuted ? lit : quiet)} onPress={() => void toggleMute($)} />)
     }
-    if (current === 'speaking') add(<Button key="stop" label="Stop" plain {...lit} onPress={() => void stop($)} />)
   }
   const live = isOn ? await indicator($, e) : null
   add(
@@ -602,7 +721,6 @@ async function settingsPane($: Engine, e: Surface) {
   const here = await read($, chat)
   const open = await read($, chatOpen)
   const isOn = await read($, enabled)
-
   type Option = { value: string; label: string }
   const plugin: Option[] = [
     { value: 'on', label: 'On: voice controls in the prompt footer' },
@@ -622,6 +740,32 @@ async function settingsPane($: Engine, e: Surface) {
     { value: 'elevenlabs:', label: `Cloud ElevenLabs: voice ${s.tts_voice ?? ''}` },
   ]
   const speeds: Option[] = SPEEDS.map(x => ({ value: x, label: x === '1.0' ? '1.0 (natural)' : x }))
+  const modes: Option[] = [
+    { value: 'live', label: 'Live: Claude answers when I have finished talking' },
+    { value: 'hold', label: 'Hold: Claude answers when I press Done' },
+  ]
+  const pauses: Option[] = [
+    { value: 'short', label: 'Short: 0.3 s after a finished sentence, 3 s mid-thought' },
+    { value: 'normal', label: 'Normal: 0.6 s after a finished sentence, 5 s mid-thought' },
+    { value: 'long', label: 'Long: 1.2 s after a finished sentence, 9 s mid-thought' },
+    { value: 'long2', label: 'Long ×2: 12 s after a finished sentence, 18 s mid-thought' },
+    { value: 'long3', label: 'Long ×3: 20 s after a finished sentence, 27 s mid-thought' },
+    { value: 'long4', label: 'Long ×4: 30 s after a finished sentence, 36 s mid-thought' },
+    { value: 'long5', label: 'Long ×5: waits 1 minute of silence' },
+    { value: 'long6', label: 'Long ×6: waits 1.5 minutes of silence' },
+    { value: 'long7', label: 'Long ×7: waits 2 minutes of silence' },
+    { value: 'long8', label: 'Long ×8: waits 3 minutes of silence' },
+    { value: 'long9', label: 'Long ×9: waits 4 minutes of silence' },
+    { value: 'long10', label: 'Long ×10: waits 5 minutes of silence' },
+  ]
+  const onOff: Option[] = [
+    { value: 'on', label: 'On: talking while Claude speaks stops its voice' },
+    { value: 'off', label: 'Off (better without headphones)' },
+  ]
+  const mode = await read($, listenMode)
+  const pause = await read($, patience)
+  const over = await read($, talkOver)
+  const remember = (key: string, value: unknown) => void $.store.set(key, value)
   /** One setting: its title with a "this chat" dropdown, the all-chats choice,
    *  and, when the dropdown is open, the same choice for this chat only. */
   const row = (
@@ -667,13 +811,31 @@ async function settingsPane($: Engine, e: Surface) {
       <Text dimColor>Each choice applies to all chats. Open "this chat" under a setting to change it for this chat only.</Text>
       <Box marginTop={1} flexDirection="column">
         {row('plugin', 'Voice plugin', plugin, isOn ? 'on' : 'off', (v: string) => void setEnabled($, v === 'on'), true)}
-        {row('listening', 'Listening (speech to text)', listening, listeningValue(s, s._platform ?? ''), (v: string) => void pickListening($, v))}
+        {row('listenMode', 'When you talk', modes, mode, (v: string) => {
+          void update($, listenMode, () => (v === 'hold' ? 'hold' : 'live'))
+          remember(MODE_STORE_KEY, v)
+        })}
+        {row('patience', 'Pause before Claude answers (live)', pauses, pause, (v: string) => {
+          void (async () => {
+            await update($, patience, () => asPatience(v))
+            await shareLiveSettings($)
+          })()
+          remember(PATIENCE_STORE_KEY, v)
+        })}
+        {row('talkOver', 'Talk over Claude (live)', onOff, over ? 'on' : 'off', (v: string) => {
+          void (async () => {
+            await update($, talkOver, () => v === 'on')
+            await shareLiveSettings($)
+          })()
+          remember(TALK_OVER_STORE_KEY, v === 'on')
+        })}
+        {row('listening', 'Listening (speech to text)', listening, listeningValue(s), (v: string) => void pickListening($, v))}
         {row('microphone', 'Microphone', microphones, s.input_device ?? '', (v: string) => void setSetting($, 'input_device', v))}
         {row('speaking', 'Speaking (text to speech)', speaking, speakingValue(s), (v: string) => void pickSpeaking($, v))}
         {row('speed', 'Speed', speeds, String(Number(s.speed ?? '1.05')), (v: string) => void setSetting($, 'speed', v))}
       </Box>
       <Box marginTop={1}>
-        <Text dimColor>The Mac's and Windows' own recognizers keep your words as you said them; each asks for permission once. Cloud engines read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>
+        <Text dimColor>Parakeet runs on this computer and downloads about 650 MB once. Cloud engines read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>
       </Box>
       <Box marginTop={1}>
         <Button key="close" label="Close" role="dismiss" onPress={() => void $.ui.close({ id: SETTINGS_PANE })} />
@@ -689,8 +851,16 @@ export const register: Register = on => {
     await $.command.register({ name: 'voice-panel', description: 'Open the voice pane (read aloud, call)' })
     await update($, isCall, () => false)
     await update($, phase, () => 'idle')
+    await update($, take, () => '')
+    await update($, hearing, () => '')
     const savedEnabled = await $.store.get(ENABLED_STORE_KEY)
     await update($, enabled, () => savedEnabled !== false)
+    const savedMode = await $.store.get(MODE_STORE_KEY)
+    await update($, listenMode, () => (savedMode === 'hold' ? 'hold' : 'live'))
+    const savedPatience = await $.store.get(PATIENCE_STORE_KEY)
+    await update($, patience, () => asPatience(savedPatience))
+    const savedTalkOver = await $.store.get(TALK_OVER_STORE_KEY)
+    await update($, talkOver, () => savedTalkOver !== false)
     const savedChat = await $.store.get(await chatStoreKey($))
     await update($, chat, () => (savedChat !== null && typeof savedChat === 'object' ? (savedChat as ChatSettings) : {}))
     return next(e)
@@ -720,7 +890,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // In a call, every finished reply is spoken; then it is your turn.
+  // In a call, every finished reply is spoken, and the mic opens for your turn.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
     if (e.agentId !== undefined || !(await read($, isCall))) return result
@@ -730,6 +900,8 @@ export const register: Register = on => {
         if (answer !== '' && !e.isAborted && (await speak($, answer))) {
           await setPhase($, 'speaking')
           watchPlayback($)
+          // Live: the mic opens while Claude talks, so you can talk over it.
+          if ((await modeHere($)) === 'live') void listenOnce($)
         } else {
           void listenOnce($)
         }

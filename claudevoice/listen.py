@@ -141,10 +141,18 @@ def _listen(argv: list[str], result_path: str | None) -> int:
                     help="hold mode: keep recording until the done flag appears, ignore pauses")
     ap.add_argument("--devices", action="store_true", help="list microphones as JSON and exit")
     # Per-chat overrides from the plugin; absent means the config file's value.
-    ap.add_argument("--stt", choices=["auto", "apple", "windows", "local", "openai"], default=None, help="speech-to-text engine")
+    ap.add_argument("--stt", choices=["auto", "parakeet", "apple", "windows", "local", "openai"], default=None, help="speech-to-text engine")
     ap.add_argument("--stt-model", default=None, help="cloud transcription model")
+    ap.add_argument("--parakeet", default=None, choices=["v2", "v3"], help="Parakeet model")
     ap.add_argument("--device", default=None, help="microphone name; empty for the system default")
     ap.add_argument("--result", default=None, help="also write the JSON answer to this file")
+    ap.add_argument("--live", action="store_true",
+                    help="live mode: end the turn when you have finished talking (Smart Turn)")
+    ap.add_argument("--patience", choices=["short", "normal", "long"] + [f"long{n}" for n in range(2, 11)], default="normal",
+                    help="live mode: how long a pause runs before your turn can end")
+    ap.add_argument("--talk-over", dest="talk_over", action="store_true", default=True,
+                    help="live mode: talking while Claude speaks stops its voice (default)")
+    ap.add_argument("--no-talk-over", dest="talk_over", action="store_false")
     ap.add_argument("--heartbeat", default=None,
                     help="a file the caller keeps touching while it waits; stale means give up")
     args = ap.parse_args(argv)
@@ -152,6 +160,8 @@ def _listen(argv: list[str], result_path: str | None) -> int:
         cfg["stt_engine"] = args.stt
     if args.stt_model:
         cfg["stt_model"] = args.stt_model
+    if args.parakeet:
+        cfg["parakeet_model"] = args.parakeet
     if args.device is not None:
         cfg["input_device"] = args.device
 
@@ -221,6 +231,10 @@ def _listen(argv: list[str], result_path: str | None) -> int:
         return 0
 
     threading.Thread(target=watch_flags, daemon=True).start()
+
+    if args.live:
+        return _live(args, cfg, stt, stop_event, muted, t0, result_path)
+
     # Hold mode: pauses never end the recording; only the Done button does (or the cap).
     silence = 1e9 if args.manual else cfg["silence_seconds"]
     # Hold mode ignores the auto-mode cap (max_record_seconds): only Done ends the take.
@@ -244,6 +258,47 @@ def _listen(argv: list[str], result_path: str | None) -> int:
         return 0
     text = stt.transcribe(audio) if len(audio) else ""
     _emit({"text": text, "seconds": seconds, "device": mic}, result_path)
+    return 0
+
+
+def _live(args, cfg: dict, stt, stop_event: threading.Event, muted: threading.Event, t0: float,
+          result_path: str | None) -> int:
+    """Live mode: one conversational turn, ended by Smart Turn, a long pause, or Done."""
+    from .live import live_turn
+
+    state_file = config.CONFIG_DIR / "listen.state"
+
+    def on_state(state: str) -> None:
+        try:
+            state_file.write_text(state)
+        except OSError:
+            pass
+
+    # Load the transcriber while you talk, so your words are ready the moment you finish.
+    threading.Thread(target=stt.warm, daemon=True).start()
+    turn = live_turn(stop_event=stop_event, paused=muted.is_set, device=cfg.get("input_device", ""),
+                     patience=args.patience, talk_over=args.talk_over, server=config.server_url(cfg),
+                     max_seconds=HOLD_MAX_SECONDS, on_state=on_state,
+                     settings_file=str(config.CONFIG_DIR / "listen.settings"))
+    cancelled = config.LISTEN_STOP_FLAG.exists() or _preempted.is_set()
+    stop_event.set()
+    config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
+    config.LISTEN_DONE_FLAG.unlink(missing_ok=True)
+    if cancelled:
+        on_state("")
+        _emit({"text": "", "seconds": 0, "cancelled": True}, result_path)
+        return 0
+    seconds = round(time.time() - t0, 1)
+    info = {"seconds": seconds, "device": turn.device, "ended_by": turn.reason, "patience": turn.patience,
+            "longest_pause": turn.longest_pause, "talked_over": turn.talked_over, "smart_turn": turn.smart_turn}
+    if turn.reason == "silent":
+        on_state("")
+        _emit({"text": "", "silent": True, **info}, result_path)
+        return 0
+    on_state("transcribing")
+    text = stt.transcribe(turn.audio) if len(turn.audio) else ""
+    on_state("")
+    _emit({"text": text, **info}, result_path)
     return 0
 
 

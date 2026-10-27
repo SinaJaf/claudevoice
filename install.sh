@@ -9,17 +9,17 @@ cd "$HERE"
 if ! command -v uv >/dev/null; then
   echo "uv is required. Install it from https://docs.astral.sh/uv/ (macOS: brew install uv)"; exit 1
 fi
-if ! command -v espeak-ng >/dev/null; then
-  echo "▸ espeak-ng (Kokoro's pronunciation fallback) is missing"
-  if command -v brew >/dev/null; then brew install espeak-ng
-  elif command -v apt-get >/dev/null; then sudo apt-get install -y espeak-ng libportaudio2
-  elif command -v dnf >/dev/null; then sudo dnf install -y espeak-ng portaudio
-  else echo "  install espeak-ng with your package manager, then re-run"; exit 1
+if [[ "$(uname -s)" == "Linux" ]] && ! ldconfig -p 2>/dev/null | grep -q libportaudio; then
+  echo "▸ the PortAudio audio library is missing"
+  if command -v apt-get >/dev/null; then sudo apt-get install -y libportaudio2
+  elif command -v dnf >/dev/null; then sudo dnf install -y portaudio
+  elif command -v pacman >/dev/null; then sudo pacman -S --noconfirm portaudio
+  else echo "  install PortAudio with your package manager, then re-run"; exit 1
   fi
 fi
 
-echo "▸ installing python deps (first time pulls torch; ~1 GB)"
-uv sync --quiet
+echo "▸ installing python deps (first time ~900 MB)"
+uv sync --quiet --inexact
 
 echo "▸ downloading Kokoro weights and warming the model"
 uv run --quiet python -c "
@@ -30,10 +30,13 @@ list(p('Kokoro is ready.', voice='af_heart'))
 print('  kokoro ok')
 " 2>&1 | grep -v Redirects || true
 
-if [[ "${CLAUDEVOICE_SKIP_WHISPER:-}" == "" ]]; then
-  echo "▸ downloading the local Whisper model (set CLAUDEVOICE_SKIP_WHISPER=1 to skip)"
-  uv run --quiet python -m claudevoice.listen --warm 2>&1 | grep -v Redirects | tail -1 || true
-fi
+echo "▸ downloading the listening models (Parakeet ~650 MB, Smart Turn, Silero VAD)"
+uv run --quiet python -c "
+from claudevoice.stt import ParakeetTranscriber
+from claudevoice.turn import SileroVAD, SmartTurn
+ParakeetTranscriber().warm(); SileroVAD(); SmartTurn()
+print('  listening models ok')
+" 2>&1 | grep -v "Fetching\|Warning" | tail -1 || true
 
 if [[ "${CLAUDEVOICE_ALWAYS_ON_HOOKS:-}" != "" ]]; then
   echo "▸ registering the optional always-on Claude Code hooks in ~/.claude/settings.json"

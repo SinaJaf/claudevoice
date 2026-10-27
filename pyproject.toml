@@ -1,6 +1,6 @@
 [project]
 name = "claudevoice"
-version = "0.2.0"
+version = "0.3.0"
 description = "Voice for Claude Code: Kokoro speech, local or cloud listening"
 readme = "README.md"
 license = "MIT"
@@ -8,13 +8,27 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "en-core-web-sm",
     "kokoro>=0.9.4",
-    "mlx-whisper>=0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "faster-whisper>=1.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
     "numpy>=1.26",
-    "preshed==3.0.10",
+    # 3.0.15 with spaCy 3.8.18: no tokenizer crash, and builds for every platform.
+    "preshed>=3.0.15",
     "sounddevice>=0.5.6",
     "soundfile>=0.14.0",
-    "spacy>=3.8",
+    # 3.8.7+ ships ready-made builds for Linux and Windows on ARM.
+    "spacy>=3.8.7",
+    "onnx-asr[cpu,hub]>=0.12",
+    # Intel Macs: PyTorch 2.2 is the last release built for them, and it needs NumPy 1.
+    "torch==2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "numpy<2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "onnxruntime<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    # Listed here so Linux takes it from the CPU index below.
+    "torch>=2.2; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+# Whisper is an optional listening engine; the plugin installs it when you pick it.
+whisper = [
+    "mlx-whisper>=0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "faster-whisper>=1.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
 ]
 
 [project.scripts]
@@ -29,3 +43,10 @@ packages = ["claudevoice"]
 
 [tool.uv.sources]
 en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+# Linux: the CPU build of PyTorch (~200 MB) instead of the default CUDA one (~2.5 GB).
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

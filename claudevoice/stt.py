@@ -1,4 +1,4 @@
-"""Speech-to-text: Apple's on-device recognizer, local Whisper, or an OpenAI-compatible cloud endpoint."""
+"""Speech-to-text: NVIDIA Parakeet (local, default), the system recognizers, Whisper, or a cloud endpoint."""
 from __future__ import annotations
 
 import io
@@ -218,11 +218,52 @@ class AppleTranscriber:
 
 
 def resolve_engine(cfg: dict) -> str:
-    """auto: the system's own recognizer where there is one (macOS, Windows), else Whisper."""
+    """auto: Parakeet, on every system."""
     engine = cfg.get("stt_engine", "auto")
-    if engine == "auto":
-        return {"darwin": "apple", "win32": "windows"}.get(sys.platform, "local")
-    return engine
+    return "parakeet" if engine == "auto" else engine
+
+
+PARAKEET_MODELS = {
+    "v2": "nemo-parakeet-tdt-0.6b-v2",  # English, the most accurate for English
+    "v3": "nemo-parakeet-tdt-0.6b-v3",  # 25 European languages
+}
+
+
+class ParakeetTranscriber:
+    """NVIDIA Parakeet TDT 0.6B (CC-BY-4.0), int8 ONNX on the CPU through onnx-asr.
+
+    Accurate, punctuated, and steady on long talk; about a second for a minute of
+    speech on a laptop. Downloads ~650 MB once.
+    """
+
+    def __init__(self, version: str = "v2") -> None:
+        self.name = PARAKEET_MODELS.get(version, PARAKEET_MODELS["v2"])
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            import onnx_asr
+            import onnxruntime as ort
+
+            so = ort.SessionOptions()
+            so.log_severity_level = 3
+            self._model = onnx_asr.load_model(self.name, quantization="int8",
+                                              providers=["CPUExecutionProvider"], sess_options=so)
+        return self._model
+
+    def warm(self) -> None:
+        self._load()
+
+    def transcribe(self, audio: np.ndarray, language: str | None = None) -> str:  # noqa: ARG002
+        if len(audio) < 1600:
+            return ""
+        model = self._load()
+        from .turn import squeeze_silence
+
+        audio = squeeze_silence(audio)  # long thinking pauses invite invented words
+        # Long turns go in pieces cut at the quietest moments, to keep memory flat.
+        parts = [model.recognize(piece.astype(np.float32), sample_rate=16_000) for piece in _pieces(audio, 16_000)]
+        return _clean(" ".join(p.strip() for p in parts if p and p.strip()))
 
 
 WINDOWS_SCRIPT = Path(__file__).parent / "windows" / "dictate.ps1"
@@ -266,12 +307,23 @@ class WindowsDictation:
             return json.loads(Path(out).read_text(encoding="utf-8-sig"))
 
 
+def _whisper_installed() -> bool:
+    import importlib.util
+
+    return any(importlib.util.find_spec(m) is not None for m in ("mlx_whisper", "faster_whisper"))
+
+
 def make_transcriber(cfg: dict, whisper_model: str | None = None):
     engine = resolve_engine(cfg)
+    if engine == "parakeet":
+        return ParakeetTranscriber(str(cfg.get("parakeet_model", "v2")))
     if engine == "apple":
         return AppleTranscriber(cfg.get("stt_language", ""))
     if engine == "windows":
         return WindowsDictation(cfg.get("stt_language", ""))
+    if engine == "local" and not _whisper_installed():
+        raise RuntimeError("Whisper is not installed; pick it again in the voice settings to install it, "
+                           "or run: uv sync --extra whisper --inexact")
     if engine == "openai":
         return CloudTranscriber(base_url=cfg["stt_base_url"], model=cfg["stt_model"], api_key_env=cfg["stt_api_key_env"])
     return Transcriber(whisper_model or cfg["whisper_model"])

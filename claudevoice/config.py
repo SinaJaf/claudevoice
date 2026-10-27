@@ -31,10 +31,12 @@ DEFAULTS: dict = {
     "port": 8765,
     # Longest reply (after markdown cleanup) that the Stop hook will read aloud.
     "max_chars": 2500,
-    # Listening (speech-to-text). "apple" is the Mac's own recognizer (the engine behind
-    # macOS dictation), on-device; "local" runs Whisper; "openai" posts the audio to an
-    # OpenAI-compatible /audio/transcriptions endpoint. "auto": apple on macOS, else local.
+    # Listening (speech-to-text). "parakeet" runs NVIDIA Parakeet locally (the default,
+    # "auto"); "apple" / "windows" use the system recognizer; "local" runs Whisper;
+    # "openai" posts the audio to an OpenAI-compatible /audio/transcriptions endpoint.
     "stt_engine": "auto",
+    # Parakeet model: "v2" English (most accurate for English), "v3" 25 European languages.
+    "parakeet_model": "v2",
     # Language for the apple engine, e.g. "en-US"; empty follows the Mac's language.
     "stt_language": "",
     # Short name: small, medium, large-v3-turbo, large-v3 (mapped to the backend's repo).
