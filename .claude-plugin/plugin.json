@@ -1,6 +1,6 @@
 {
   "name": "claudevoice",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Voice for Claude Code: read replies and files (markdown, text, PDF) aloud with Kokoro and hold spoken calls, with local or cloud speech engines",
   "author": { "name": "SinaJaf" },
   "homepage": "https://github.com/SinaJaf/claudevoice",

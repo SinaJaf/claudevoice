@@ -19,7 +19,7 @@ const WAVE = /[▁▃▅▇]/
 type Reading = { title: string; at: number; of: number; paused: boolean } | null
 
 /** The world beneath the mod: a running Kokoro server, a session with one reply. */
-function world(on: On, state: { speaking: boolean; reading?: Reading }) {
+function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { mac?: boolean } = {}) {
   const fetches: Fetch[] = []
   const runs: string[][] = []
   const submitted: string[] = []
@@ -76,8 +76,27 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }) {
   const listener = { answer: 'now' as 'now' | 'on-done', done: false }
   // The clipboard, as wl-paste reads it (this test machine is neither a Mac nor Windows).
   const clip = { text: 'something copied long ago' }
+  // On a Mac, the helper reports the clipboard (with its change count) and, asked about the
+  // app, what is highlighted in it.
+  const mac = { changeCount: 5, highlighted: '', openFile: [] as string[], asked: [] as string[][] }
   on('process.run', (_, e) => {
     if (e.argv[0] === 'wl-paste') return { value: { exitCode: 0, stdout: clip.text, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[0] === 'git') {
+      // The project's tracked files, for a bare name the Files pane shows.
+      const tracked = ['README.md', 'docs/guide.md', 'docs/todo.md', 'old/todo.md']
+      const name = (e.argv[e.argv.length - 1] ?? '').replace(':(glob)**/', '')
+      const stdout = tracked.filter(f => f === name || f.endsWith(`/${name}`)).join('\n')
+      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (e.argv[0] === '/usr/bin/osascript') {
+      mac.asked.push([...e.argv])
+      const inApp = e.argv.includes('app')
+      const stdout = JSON.stringify({
+        changeCount: mac.changeCount, clipboard: clip.text, selection: inApp ? mac.highlighted : '',
+        areas: inApp ? 2 : 0, lengths: inApp ? [0, mac.highlighted.length] : [], openFile: inApp ? mac.openFile : [],
+      })
+      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     runs.push([...e.argv])
     const at = e.argv.indexOf('--result')
     if (at >= 0) {
@@ -110,9 +129,9 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }) {
   on('ui.toast', () => ({ value: undefined }))
   // The machine beneath: a venv already set up, a home folder.
   const answered = (path: string) => results.has(path) && (listener.answer === 'now' || listener.done)
-  on('fs.exists', (_, e) => ({ value: e.path.endsWith('/.venv/bin/python') || answered(e.path) }))
+  on('fs.exists', (_, e) => ({ value: e.path.endsWith('/.venv/bin/python') || answered(e.path) || (opts.mac === true && e.path === '/usr/bin/osascript') }))
   // The project's files, and what is selected on screen.
-  const files = new Set(['/proj/notes.md', '/proj/docs/guide.pdf', '/home/tester/my notes.md'])
+  const files = new Set(['/proj/notes.md', '/proj/docs/guide.pdf', '/home/tester/my notes.md', '/proj/README.md', '/proj/docs/guide.md'])
   on('fs.stat', (_, e) => {
     if (!files.has(e.path)) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
     return { value: { kind: 'file' as const, size: 100, mtimeMs: 0, isLink: false } }
@@ -128,7 +147,7 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }) {
     writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip }
+  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -594,4 +613,93 @@ test('In a call the app footer stays narrow: End for End call, and nothing widen
   expect((await term.find({ key: 'end' }))?.text).toBe('End call')
   await term.press({ key: 'end' })
   await term.unmount()
+})
+
+test('On a Mac, text highlighted in the Files pane is read, and copying the same text again counts', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state, { mac: true })
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+
+  // Highlighted in a file open in the app (the app itself tells plugins only about the chat).
+  w.mac.highlighted = 'A section of the README, highlighted in the Files pane.'
+  await ui.press({ key: 'read' })
+  expect(w.mac.asked.pop()).toContain('app')
+  expect(readBody(w)).toEqual({ text: 'A section of the README, highlighted in the Files pane.', title: 'selection' })
+  expect(w.writes.filter(x => x.path.endsWith('last-read.json')).pop()?.content).toContain('"source":"highlighted in the app"')
+  // What was read is not written down, only how long it was.
+  expect(w.writes.filter(x => x.path.endsWith('last-read.json')).pop()?.content).not.toContain('README')
+  await ui.press({ key: 'stop' })
+  w.mac.highlighted = ''
+
+  // Copied: read. Copied again, the very same text: read again (the copy counter moved).
+  w.clip.text = 'Copied from a PDF in Preview.'
+  w.mac.changeCount = 6
+  await ui.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ text: 'Copied from a PDF in Preview.', title: 'copied text' })
+  await ui.press({ key: 'stop' })
+  w.mac.changeCount = 7
+  w.fetches.length = 0
+  await ui.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ text: 'Copied from a PDF in Preview.', title: 'copied text' })
+  await ui.press({ key: 'stop' })
+
+  // Nothing new: the last reply.
+  w.fetches.length = 0
+  await ui.press({ key: 'read' })
+  expect(w.fetches.some(f => f.url.endsWith('/read'))).toBe(false)
+  expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('Hello')
+  await ui.press({ key: 'stop' })
+  await ui.unmount()
+
+  // In the terminal, the app is not asked about.
+  const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await term.press({ key: 'read' })
+  expect(w.mac.asked.pop()).not.toContain('app')
+  await term.unmount()
+})
+
+test('On a Mac, with nothing highlighted, Read aloud reads the whole file open in the Files pane', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state, { mac: true })
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+
+  // The pane's header shows the path in parts, starting above the project folder.
+  w.mac.openFile = ['proj', 'docs', 'guide.md']
+  await ui.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ path: '/proj/docs/guide.md' })
+  expect(w.writes.filter(x => x.path.endsWith('last-read.json')).pop()?.content).toContain('"source":"file open in the Files pane"')
+  await ui.press({ key: 'stop' })
+
+  // Only the name: found at the top of the project, or once among its tracked files.
+  w.mac.openFile = ['README.md']
+  await ui.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ path: '/proj/README.md' })
+  await ui.press({ key: 'stop' })
+  w.mac.openFile = ['guide.md']
+  await ui.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ path: '/proj/docs/guide.md' })
+  await ui.press({ key: 'stop' })
+
+  // A name two tracked files share, or a tab that is no file (a web page): the last reply.
+  for (const tab of [['todo.md'], ['GitHub - a page']]) {
+    w.mac.openFile = tab
+    w.fetches.length = 0
+    await ui.press({ key: 'read' })
+    expect(w.fetches.some(f => f.url.endsWith('/read'))).toBe(false)
+    expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('Hello')
+    await ui.press({ key: 'stop' })
+  }
+
+  // A highlight in that file still wins: just that part is read.
+  w.mac.openFile = ['README.md']
+  w.mac.highlighted = 'Only this paragraph.'
+  await ui.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ text: 'Only this paragraph.', title: 'selection' })
+  await ui.unmount()
 })

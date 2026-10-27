@@ -294,28 +294,47 @@ function startTicker($: Engine): void {
   step()
 }
 
-/** Read aloud what you point at: text you have just copied (anywhere: a file open in the
- *  app, a PDF in another app; a copied path reads that file), else the text you have
- *  selected in the chat, else a file named in the prompt box (`@notes.md`, `@guide.pdf`,
- *  a path), from its start or the lines it names, else Claude's last reply. */
-async function readAloud($: Engine): Promise<void> {
-  const copied = await freshCopy($)
+/** Read aloud what you point at: text you have just copied (anywhere: a PDF in another
+ *  app; a copied path reads that file), else the text you have highlighted in the chat,
+ *  else, in the desktop app on macOS, the text highlighted anywhere in it (a file in its
+ *  Files pane), else a file named in the prompt box (`@notes.md`, `@guide.pdf`, a path),
+ *  from its start or the lines it names, else (macOS) the whole file open in the Files
+ *  pane, else Claude's last reply. */
+async function readAloud($: Engine, inApp = true): Promise<void> {
+  const seen = await look($, inApp)
+  const copied = await freshCopy($, seen)
   if (copied !== '') {
     const line = copied.trim()
     const asFile = line.includes('\n') ? null : await findFile($, line.replace(/^(["'])(.*)\1$/, '$2'))
+    await noteRead($, asFile ? 'copied path' : 'copied text', copied.length, seen)
     await readDocument($, asFile ?? { text: copied, title: 'copied text' })
     return
   }
   const selected = await $.ui.selection().catch(() => undefined)
   if (selected !== undefined && selected.text.trim() !== '') {
+    await noteRead($, 'chat selection', selected.text.length, seen)
     await readDocument($, { text: selected.text, title: 'selection' })
     return
   }
+  if (seen.highlighted.trim() !== '') {
+    await noteRead($, 'highlighted in the app', seen.highlighted.length, seen)
+    await readDocument($, { text: seen.highlighted, title: 'selection' })
+    return
+  }
+  tellAboutAccessibility($, seen)
   const file = await fileInPrompt($)
   if (file !== null) {
+    await noteRead($, 'file in the prompt box', 0, seen)
     await readDocument($, file)
     return
   }
+  const open = seen.openFile.length > 0 ? await openFileOnDisk($, seen.openFile) : null
+  if (open !== null) {
+    await noteRead($, 'file open in the Files pane', 0, seen)
+    await readDocument($, open)
+    return
+  }
+  await noteRead($, 'last reply', 0, seen)
   await readLastReply($)
 }
 
@@ -331,13 +350,53 @@ async function readLastReply($: Engine): Promise<void> {
   watchPlayback($)
 }
 
-// ---- what you copied ------------------------------------------------------------------
-// The app tells a plugin what is selected in the chat, not in its Files pane or in other
-// apps. There, copy (⌘C / Ctrl+C) and press Read aloud: a copy made since the plugin last
-// looked is read. One that came out of this chat is left alone, so copying a command
-// from a reply doesn't stop Read aloud reading the reply.
+// ---- what you highlighted or copied ------------------------------------------------------
+// The app tells a plugin what is highlighted in the chat, not in its Files pane. On macOS
+// a helper reads the highlight anywhere in the app through Accessibility (which the app
+// already holds), and the clipboard's change count with it. Elsewhere, and for other apps,
+// copy (⌘C / Ctrl+C) and press Read aloud: a copy made since the plugin last looked is
+// read. One that came out of this chat is left alone, so copying a command from a reply
+// doesn't stop Read aloud reading the reply.
 
-let lastCopied: string | null = null // the clipboard when last looked at; null: not yet
+type Seen = {
+  clipboard: string
+  stamp: string // changes with every copy: macOS's change count, else the text itself
+  highlighted: string // highlighted in the Claude app (macOS only)
+  areas: number
+  lengths: number[]
+  openFile: string[] // the file open in the app's Files pane: its path parts as the pane shows them
+  trusted: boolean // the Claude app may use Accessibility, so its highlights can be read
+}
+
+let lastStamp: string | null = null // the clipboard's stamp when last looked at; null: not yet
+
+const OSASCRIPT = '/usr/bin/osascript'
+
+/** The clipboard, and with `inApp` what is highlighted in the Claude app (macOS). */
+async function look($: Engine, inApp: boolean): Promise<Seen> {
+  if (await $.fs.exists(OSASCRIPT)) {
+    const helper = `${root($)}/claudevoice/apple/selection.js`
+    const ran = await $.process.run([OSASCRIPT, '-l', 'JavaScript', helper, ...(inApp ? ['app'] : [])], { timeoutMs: 10000 })
+    try {
+      const seen = JSON.parse(ran.stdout) as {
+        clipboard?: string; changeCount?: number; selection?: string; areas?: number; lengths?: number[]; openFile?: string[]; trusted?: boolean
+      }
+      return {
+        clipboard: seen.clipboard ?? '',
+        stamp: `#${seen.changeCount ?? ''}`,
+        highlighted: seen.selection ?? '',
+        areas: seen.areas ?? 0,
+        lengths: seen.lengths ?? [],
+        openFile: seen.openFile ?? [],
+        trusted: seen.trusted !== false,
+      }
+    } catch {
+      // the helper failed: read the clipboard the plain way
+    }
+  }
+  const text = await clipboard($)
+  return { clipboard: text, stamp: text, highlighted: '', areas: 0, lengths: [], openFile: [], trusted: true }
+}
 
 /** The clipboard's text on macOS, Windows or Linux; '' when it can't be read. */
 async function clipboard($: Engine): Promise<string> {
@@ -358,15 +417,48 @@ async function clipboard($: Engine): Promise<string> {
 }
 
 /** Text copied since the plugin last looked, and not copied out of this chat; else ''. */
-async function freshCopy($: Engine): Promise<string> {
-  const text = await clipboard($)
-  const before = lastCopied
-  lastCopied = text
-  if (before === null || text === before || text.trim() === '') return ''
+async function freshCopy($: Engine, seen: Seen): Promise<string> {
+  const before = lastStamp
+  lastStamp = seen.stamp
+  const text = seen.clipboard
+  if (before === null || seen.stamp === before || text.trim() === '') return ''
   const squeeze = (t: string) => t.replace(/\s+/g, ' ').trim()
   const copied = squeeze(text)
   const messages = await $.session.messages()
   return messages.some(m => squeeze(m.text).includes(copied)) ? '' : text
+}
+
+/** The file open in the app's Files pane, on disk. The pane shows a path in parts (it may
+ *  start above the project folder), so the longest tail of it that is a file here wins; a
+ *  bare name found nowhere is looked for once in the project's tracked files. */
+async function openFileOnDisk($: Engine, parts: string[]): Promise<FileToRead | null> {
+  for (let i = 0; i < parts.length; i++) {
+    const file = await findFile($, parts.slice(i).join('/'))
+    if (file !== null) return file
+  }
+  const name = parts[parts.length - 1]
+  if (name === undefined || name === '') return null
+  const cwd = await $.session.cwd()
+  const ran = await $.process.run(['git', '-C', cwd, 'ls-files', '--', `:(glob)**/${name}`], { timeoutMs: 10000 }).catch(() => null)
+  const matches = ran?.exitCode === 0 ? ran.stdout.split('\n').filter(line => line.trim() !== '') : []
+  return matches.length === 1 ? findFile($, matches[0] ?? '') : null
+}
+
+/** What the last press of Read aloud found, without the text: for working out why it read
+ *  what it did (~/.claudevoice/last-read.json). */
+async function noteRead($: Engine, source: string, chars: number, seen: Seen): Promise<void> {
+  await touch($, 'last-read.json', JSON.stringify({
+    at: new Date(await $.clock.now()).toISOString(), source, chars, areas: seen.areas, highlighted: seen.lengths, trusted: seen.trusted,
+  }))
+}
+
+let toldAboutAccessibility = false
+
+/** Once a session: a highlight outside the chat can be read once the app may use Accessibility. */
+function tellAboutAccessibility($: Engine, seen: Seen): void {
+  if (seen.trusted || toldAboutAccessibility) return
+  toldAboutAccessibility = true
+  $.ui.toast('To read text highlighted in the Files pane, allow Claude in System Settings, Privacy & Security, Accessibility. Or copy it, then press Read aloud.')
 }
 
 type FileToRead = { path: string; start?: number; end?: number }
@@ -840,7 +932,7 @@ async function controls($: Engine, e: Surface, compact: boolean) {
       <Box>
         {await indicator($, e)}
         <Box flexGrow={1} />
-        {!inCall && <Button key="read" label="Read aloud" hotkey="r" plain onPress={() => void readAloud($)} />}
+        {!inCall && <Button key="read" label="Read aloud" hotkey="r" plain onPress={() => void readAloud($, e.surface === 'desktop')} />}
         {!inCall && <Text> </Text>}
         {isReading && current === 'speaking' && !r.paused && <Button key="pause" label="Pause" hotkey="p" plain onPress={() => void pauseReading($)} />}
         {isReading && r.paused && current !== 'speaking' && <Button key="resume" label="Resume" hotkey="p" onPress={() => void resumeReading($)} />}
@@ -898,7 +990,7 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   if (modes.length > 0) add(<Text key="modes" dimColor>{modes.join(' & ')}</Text>)
   if (isOn) {
     // While something plays, Pause/Resume and Stop take Read aloud's place.
-    if (!inCall && !playing) add(<Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />)
+    if (!inCall && !playing) add(<Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($, e.surface === 'desktop')} />)
     if (inCall && current === 'listening') add(<Button key="done" label="Done" plain {...lit} onPress={() => void done($)} />)
     if (isReading && current === 'speaking' && !r.paused) add(<Button key="pause" label="Pause" plain {...lit} onPress={() => void pauseReading($)} />)
     if (isReading && r.paused && current !== 'speaking') add(<Button key="resume" label="Resume" plain {...lit} onPress={() => void resumeReading($)} />)
@@ -1095,8 +1187,8 @@ export const register: Register = on => {
     const savedChat = await $.store.get(await chatStoreKey($))
     await update($, chat, () => (savedChat !== null && typeof savedChat === 'object' ? (savedChat as ChatSettings) : {}))
     // Only what is copied from now on counts as "just copied".
-    void clipboard($).then(text => {
-      if (lastCopied === null) lastCopied = text
+    void look($, false).then(seen => {
+      if (lastStamp === null) lastStamp = seen.stamp
     })
     return next(e)
   })

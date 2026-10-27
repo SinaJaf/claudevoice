@@ -57,21 +57,28 @@ finished sentence ends it after a short pause. A long pause ends it anyway, and 
 
 **Read aloud** reads what you point it at, in this order:
 
-1. **Text you've just copied.** In a file open in the app's Files pane, or a PDF in any other app,
-   highlight a section, copy it (⌘C, or Ctrl+C), and press **Read aloud**. A copied file path
-   reads that file. Something copied out of the chat itself is left alone.
-2. **Text you've selected in the chat.** Highlight it and press **Read aloud**; no copying needed.
+1. **Text you've just copied.** In any app (a PDF in Preview, a web page), highlight a section, copy
+   it (⌘C, or Ctrl+C), and press **Read aloud**. A copied file path reads that file. Copying the
+   same text again counts. Something copied out of the chat itself is left alone.
+2. **Text you've highlighted.** In the chat, or, on a Mac, anywhere in the app, such as a file
+   open in the Files pane: highlight a section and press **Read aloud**, no copying needed. On
+   Windows and Linux, copy text in the Files pane first.
 3. **A file named in the prompt box.** Type `@` and pick the file (`@notes.md`, `@report.pdf`),
    then press **Read aloud** to hear it from the start. `@notes.md#L40-80` reads just those lines.
    A path dragged into the box works too.
-4. **Otherwise**, Claude's last reply.
+4. **The file open in the Files pane** (on a Mac): with nothing highlighted, **Read aloud** reads
+   the whole file, from the start.
+5. **Otherwise**, Claude's last reply.
 
 <p align="center">
   <img src="docs/images/read.png" width="640" alt="Reading a file aloud: Read aloud, then Pause and Stop with a bar and 12% by the gear while it reads, then Resume and Stop with 25% once paused.">
 </p>
 
-Why copy in the Files pane: the app tells plugins what you've highlighted in the chat, but not in
-the Files pane, and not which file is open there.
+The app tells plugins only what you've highlighted in the chat. On a Mac, claudevoice reads a
+highlight anywhere in the app, and which file the Files pane has open, through macOS Accessibility:
+the permission the Claude app has under System Settings, Privacy & Security, Accessibility (it does
+if you use computer use; if not, a one-time tip says where to turn it on). On Windows and Linux,
+copy text in the Files pane, or name the file with `@`.
 
 While a file is being read, **Pause** keeps your place, **Resume** carries on from the sentence you
 paused in, and **Stop** ends it. The gear shows how far it has got. **Call** steps aside while a
@@ -193,7 +200,7 @@ Claude Code (any surface)
 ```
 
 - `hooks/register.tsx` is the Claude Code plugin: the footer controls, the settings dialog, Read
-  aloud (what you copied, the chat selection, a file named in the box, or the last reply), the
+  aloud (what you copied, what you highlighted, a file named in the box, or the last reply), the
   call loop (a detached listener per turn, `$.prompt.submit`, `turn.complete`), and a spoken-style
   note Claude receives during calls. It also routes the app's built-in speech calls through the chosen speaking engine.
 - `claudevoice/` is the Python side, run through the project's `uv` environment:
@@ -206,7 +213,8 @@ Claude Code (any surface)
 - `listen.py` runs one turn and transcribes it. `live.py` is live mode: Silero VAD hears speech,
   Smart Turn (`turn.py`, its Whisper features computed in numpy) judges each pause, and talking
   while the voice server is speaking stops it. `record.py` follows the system's input device.
-  `stt.py` picks the engine: Parakeet through onnx-asr (int8, CPU), `apple/ClaudeVoiceSTT.swift`, a tiny signed
+  `apple/selection.js` (run with `osascript`, nothing to build) reads the clipboard, what is
+  highlighted in the Claude app, and the file its Files pane has open, on a Mac. `stt.py` picks the engine: Parakeet through onnx-asr (int8, CPU), `apple/ClaudeVoiceSTT.swift`, a tiny signed
   helper app running the Mac's on-device recognizer (macOS grants speech recognition only to an
   app that declares it), `windows/dictate.ps1` driving Windows' recognizer from the built-in
   Windows PowerShell (it listens to the default mic itself, phrase by phrase, until Done), Whisper (mlx-whisper on Apple Silicon, faster-whisper elsewhere), or a
@@ -238,8 +246,10 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 ## Troubleshooting
 
 - Logs: `~/.claudevoice/server.log` (speech) and `~/.claudevoice/claudevoice.log` (hooks).
-- **Read aloud** read something you copied earlier: it reads anything copied since you last
-  pressed it. Press **Stop**, then **Read aloud** again for Claude's reply.
+- **Read aloud** read something other than you meant: it reads anything copied since you last
+  pressed it, then text still highlighted (in the Files pane too). Press **Stop**, click away from
+  the highlight, and press **Read aloud** again. `~/.claudevoice/last-read.json` says what the last
+  press found (where it came from and how long it was, never the text).
 - The footer ends in "…": the app gives it a fixed width and cuts what doesn't fit. Hover over it
   to see the whole row, or widen the window.
 - "speech recognition is not allowed": turn on **Claude Voice transcription** in System Settings,
