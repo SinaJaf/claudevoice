@@ -491,27 +491,25 @@ type Surface = Parameters<Engine['ui']['resolve']>[0]
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
 const WAVE = ['▁▃▅▃', '▃▅▇▅', '▅▇▅▃', '▇▅▃▁', '▅▃▁▃', '▃▁▃▅'] as const
 
-/** The live status: what is happening now, animated. */
-async function liveStatus($: Engine, e: Surface) {
+/** A small live indicator: a glyph and one word, set beside the gear. */
+async function indicator($: Engine, e: Surface) {
   const { Box, Text } = $.ui.resolve(e)
   const current = await read($, phase)
   const t = await read($, tick)
   const isMuted = await read($, muted)
   if (current === 'idle') return null
-  const glyph = (text: string, color: string) => <Text key="glyph" color={color}>{text}</Text>
-  const parts = {
-    loading: [glyph(SPINNER[t % SPINNER.length] ?? '', 'claude'), 'starting the voice'],
-    listening: isMuted
-      ? [glyph('◌', 'warning'), 'mic muted · what you said is kept']
-      : [glyph(t % 4 < 2 ? '●' : '○', 'error'), 'listening · take your time, then Done'],
-    transcribing: [glyph(SPINNER[t % SPINNER.length] ?? '', 'claude'), 'writing down what you said'],
-    thinking: [glyph(SPINNER[t % SPINNER.length] ?? '', 'claude'), 'thinking'],
-    speaking: [glyph(WAVE[t % WAVE.length] ?? '', 'claude'), 'speaking'],
+  const spin = SPINNER[t % SPINNER.length] ?? ''
+  const [glyph, color, word] = {
+    loading: [spin, 'claude', 'starting'],
+    listening: isMuted ? ['◌', 'warning', 'muted'] : [t % 2 === 0 ? '●' : '○', 'error', 'listening'],
+    transcribing: [spin, 'claude', 'writing'],
+    thinking: [spin, 'claude', 'thinking'],
+    speaking: [WAVE[t % WAVE.length] ?? '', 'claude', 'speaking'],
   }[current]
   return (
-    <Box>
-      {parts[0]}
-      <Text dimColor> {parts[1]}</Text>
+    <Box key="indicator">
+      <Text color={color}>{glyph}</Text>
+      <Text dimColor> {word}</Text>
     </Box>
   )
 }
@@ -528,16 +526,16 @@ async function controls($: Engine, e: Surface, compact: boolean) {
   return (
     <Box flexDirection="column">
       <Box>
-        {await liveStatus($, e)}
+        {await indicator($, e)}
         <Box flexGrow={1} />
         {!inCall && <Button key="read" label="Read aloud" hotkey="r" plain onPress={() => void readAloud($)} />}
         {!inCall && <Text> </Text>}
-        {inCall && <Button key="done" label="Done" hotkey="d" variant="primary" onPress={() => void done($)} />}
-        {inCall && <Text> </Text>}
-        {inCall && <Button key="mute" label={(await read($, muted)) ? 'Unmute' : 'Mute'} hotkey="u" plain onPress={() => void toggleMute($)} />}
-        {inCall && <Text> </Text>}
-        {(inCall || current === 'speaking') && <Button key="stop" label="Stop" hotkey="s" plain onPress={() => void stop($)} />}
-        {(inCall || current === 'speaking') && <Text> </Text>}
+        {inCall && current === 'listening' && <Button key="done" label="Done" hotkey="d" variant="primary" onPress={() => void done($)} />}
+        {inCall && current === 'listening' && <Text> </Text>}
+        {inCall && current === 'listening' && <Button key="mute" label={(await read($, muted)) ? 'Unmute' : 'Mute'} hotkey="u" plain onPress={() => void toggleMute($)} />}
+        {inCall && current === 'listening' && <Text> </Text>}
+        {current === 'speaking' && <Button key="stop" label="Stop" hotkey="s" plain onPress={() => void stop($)} />}
+        {current === 'speaking' && <Text> </Text>}
         <Button key="settings" label="⚙" hotkey="g" plain onPress={() => void openSettings($)} />
         <Text> </Text>
         {inCall ? (
@@ -552,77 +550,45 @@ async function controls($: Engine, e: Surface, compact: boolean) {
   )
 }
 
-/** The controls drawn inside the prompt footer, under the mic. In a call the same
- *  controls always stand in the same places; the one that matters now lights up. */
+/** The controls drawn inside the prompt footer, under the mic, styled like the footer's
+ *  own items. Only what can be used right now is shown; a small indicator sits by the gear. */
 async function footer($: Engine, e: Surface, modes: readonly string[]) {
   const { Box, Button, Text } = $.ui.resolve(e)
   const isOn = await isEnabled($)
   const current = await read($, phase)
   const inCall = await read($, isCall)
+  const isMuted = await read($, muted)
   const quiet = { dimColor: true, hover: { dimColor: false, scope: 'voice' } } as const
   const lit = { hover: { bold: true, scope: 'voice' } } as const
-  const gear = <Button key="settings" label="⚙" plain {...quiet} onPress={() => void openSettings($)} />
-  const sep = <Text dimColor> · </Text>
-  const modeLabel = modes.length > 0 ? <Text dimColor>{modes.join(' & ')}</Text> : null
-
-  if (!isOn) {
-    return (
-      <Box>
-        {modeLabel}
-        {modeLabel && sep}
-        {gear}
-      </Box>
-    )
+  const items: JSX.Element[] = []
+  const add = (el: JSX.Element) => {
+    if (items.length > 0) items.push(<Text key={`sep-${items.length}`} dimColor> · </Text>)
+    items.push(el)
   }
 
-  const status = await liveStatus($, e)
-  const isMuted = await read($, muted)
-  const yourTurn = current === 'listening'
-  const speaking = current === 'speaking'
-  return (
-    <Box>
-      {modeLabel}
-      {modeLabel && sep}
-      {status}
-      {status && sep}
-      {!inCall && <Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />}
-      {!inCall && sep}
-      {inCall && (
-        <Box key="done-box">
-          <Text color={yourTurn ? 'success' : undefined} dimColor={!yourTurn}>✓ </Text>
-          <Button key="done" label="Done" plain dimColor={!yourTurn} {...(yourTurn ? lit : { hover: quiet.hover })} onPress={() => void done($)} />
-        </Box>
-      )}
-      {inCall && sep}
-      {inCall && (
-        <Box key="mute-box">
-          <Text color={isMuted ? 'warning' : undefined} dimColor={!isMuted}>{isMuted ? '◌ ' : '◉ '}</Text>
-          <Button key="mute" label={isMuted ? 'Unmute' : 'Mute'} plain dimColor={!isMuted} {...(isMuted ? lit : { hover: quiet.hover })} onPress={() => void toggleMute($)} />
-        </Box>
-      )}
-      {inCall && sep}
-      {(inCall || speaking) && (
-        <Box key="stop-box">
-          <Text dimColor={!speaking}>■ </Text>
-          <Button key="stop" label="Stop" plain dimColor={!speaking} {...(speaking ? lit : { hover: quiet.hover })} onPress={() => void stop($)} />
-        </Box>
-      )}
-      {(inCall || speaking) && sep}
-      {gear}
-      {sep}
-      {inCall ? (
-        <Box key="end-box">
-          <Text color="error">✕ </Text>
-          <Button key="end" label="End call" plain {...lit} onPress={() => void endCall($, '')} />
-        </Box>
-      ) : (
-        <Box key="call-box">
-          <Text color="claude">● </Text>
-          <Button key="call" label="Call" plain {...lit} onPress={() => void startCall($)} />
-        </Box>
-      )}
-    </Box>
+  if (modes.length > 0) add(<Text key="modes" dimColor>{modes.join(' & ')}</Text>)
+  if (isOn) {
+    if (!inCall) add(<Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />)
+    if (inCall && current === 'listening') {
+      add(<Button key="done" label="Done" plain {...lit} onPress={() => void done($)} />)
+      add(<Button key="mute" label={isMuted ? 'Unmute' : 'Mute'} plain {...(isMuted ? lit : quiet)} onPress={() => void toggleMute($)} />)
+    }
+    if (current === 'speaking') add(<Button key="stop" label="Stop" plain {...lit} onPress={() => void stop($)} />)
+  }
+  const live = isOn ? await indicator($, e) : null
+  add(
+    <Box key="gear-box">
+      {live}
+      {live && <Text> </Text>}
+      <Button key="settings" label="⚙" plain {...quiet} onPress={() => void openSettings($)} />
+    </Box>,
   )
+  if (isOn) {
+    add(inCall
+      ? <Button key="end" label="End call" plain {...lit} onPress={() => void endCall($, '')} />
+      : <Button key="call" label="● Call" plain {...lit} onPress={() => void startCall($)} />)
+  }
+  return <Box>{items}</Box>
 }
 
 async function settingsPane($: Engine, e: Surface) {

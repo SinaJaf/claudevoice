@@ -48,24 +48,40 @@ guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: localeId)),
 }
 
 /// One piece: its text, "" when it holds no speech, or nil and an error.
+///
+/// The recognizer works utterance by utterance. While one is being spoken its results carry
+/// no timing; when it ends, it is reported once with timing, and the next utterance starts
+/// from an empty transcription (the earlier words are not in it). So each utterance is kept
+/// when its timed result arrives; the final result repeats the last one and is skipped; an
+/// utterance still untimed when the audio ends is kept as it stands.
 func transcribe(_ url: URL) -> (String?, String?) {
     let request = SFSpeechURLRecognitionRequest(url: url)
     request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
-    request.shouldReportPartialResults = false
+    request.shouldReportPartialResults = true
     request.addsPunctuation = true
-    var text: String? = nil
+    var kept: [(start: TimeInterval, text: String)] = []
+    var pending = ""
     var failure: String? = nil
     var settled = false
     let task = recognizer.recognitionTask(with: request) { result, error in
         if let result = result {
-            text = result.bestTranscription.formattedString
+            let transcription = result.bestTranscription
+            let text = transcription.formattedString
+            let end = transcription.segments.last.map { $0.timestamp + $0.duration } ?? 0
+            if end > 0 {
+                let start = transcription.segments.first?.timestamp ?? 0
+                let repeated = kept.contains { abs($0.start - start) < 0.05 }
+                if !repeated && !text.isEmpty { kept.append((start, text)) }
+                pending = ""
+            } else {
+                pending = text
+            }
             if result.isFinal { settled = true }
         }
         if let error = error as NSError? {
             // "No speech detected" is an empty piece, not a failure.
-            if error.domain == "kAFAssistantErrorDomain" && (error.code == 1110 || error.code == 1101) {
-                text = text ?? ""
-            } else if text == nil {
+            let noSpeech = error.domain == "kAFAssistantErrorDomain" && (error.code == 1110 || error.code == 1101)
+            if !noSpeech && kept.isEmpty && pending.isEmpty {
                 failure = error.localizedDescription
             }
             settled = true
@@ -74,7 +90,14 @@ func transcribe(_ url: URL) -> (String?, String?) {
     pump(until: { settled }, timeout: 300)
     _ = task
     if let failure = failure { return (nil, failure) }
-    return (text ?? "", nil)
+    var parts = kept.sorted { $0.start < $1.start }.map { $0.text }
+    if !pending.isEmpty { parts.append(pending) }
+    // A pause between utterances usually ends a sentence; mark it where the recognizer did not.
+    let joined = parts.enumerated().map { index, part -> String in
+        guard index < parts.count - 1, let last = part.last, !".?!,;:".contains(last) else { return part }
+        return part + "."
+    }
+    return (joined.joined(separator: " "), nil)
 }
 
 var parts: [String] = []

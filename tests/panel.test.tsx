@@ -112,8 +112,9 @@ test('A call: the mic records until Done, the words are sent, the answer is spok
   await ui.press({ key: 'call' })
   expect(w.runs.some(argv => argv.includes('--warm'))).toBe(true)
   expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('press Done')
-  // The controls stand in place for the whole call.
-  for (const key of ['done', 'mute', 'stop', 'settings', 'end']) expect(await ui.find({ key })).toBeDefined()
+  // While Claude speaks: Stop, no Done (there is nothing to send yet).
+  expect(await ui.find({ key: 'stop' })).toBeDefined()
+  expect(await ui.find({ key: 'done' })).toBeUndefined()
 
   // Greeting ends: the mic opens on its own, in hold mode, detached.
   state.speaking = false
@@ -122,12 +123,17 @@ test('A call: the mic records until Done, the words are sent, the answer is spok
   expect(listen).toContain('--manual')
   expect(listen).toContain('--detach')
   expect(await ui.find({ type: 'Text', text: /listening/ })).toBeDefined()
+  // While listening: Done and Mute, no Stop.
+  expect(await ui.find({ key: 'done' })).toBeDefined()
+  expect(await ui.find({ key: 'mute' })).toBeDefined()
+  expect(await ui.find({ key: 'stop' })).toBeUndefined()
 
   // Done tells the listener to finish; its words are sent.
   expect(listen).toContain('--heartbeat')
   await ui.press({ key: 'done' })
   expect(w.written.some(p => p.endsWith('listen.done'))).toBe(true)
-  expect(await ui.find({ type: 'Text', text: /writing down/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /writing/ })).toBeDefined()
+  expect(await ui.find({ key: 'done' })).toBeUndefined()
   await clock.advance(400)
   expect(w.submitted).toEqual(['what time is it'])
 
@@ -231,7 +237,7 @@ test('Stop cuts the voice and the mic opens; Mute pauses it without losing the t
   await ui.press({ key: 'mute' })
   expect(w.writes.filter(x => x.path.endsWith('listen.mute')).pop()?.content).toBe('1')
   expect(w.written.some(p => p.endsWith('listen.stop'))).toBe(false)
-  expect(await ui.find({ type: 'Text', text: /mic muted/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /muted/ })).toBeDefined()
   await ui.press({ key: 'mute' })
   expect(w.writes.filter(x => x.path.endsWith('listen.mute')).pop()?.content).toBe('0')
   await ui.unmount()

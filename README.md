@@ -6,22 +6,23 @@ right inside the chat. You talk, press **Done**, Claude answers out loud with
 again by itself for your next turn. No clicking the mic on and off between turns.
 
 ```
-Auto · Read aloud · ⚙ · ● Call                                       ← idle, in the prompt footer
-● listening · take your time, then Done · ✓ Done · ◉ Mute · ■ Stop · ⚙ · ✕ End call   ← on a call
+Auto · Read aloud · ⚙ · ● Call               ← idle, in the prompt footer
+Done · Mute · ● listening ⚙ · End call       ← your turn
+Stop · ▃▅▇▅ speaking ⚙ · End call            ← Claude talking
 ```
 
 How a call goes:
 
 1. **● Call** starts it. Claude says it's listening.
-2. Talk. Pause and think as long as you like: nothing is sent until you press **✓ Done**.
+2. Talk. Pause and think as long as you like: nothing is sent until you press **Done**.
 3. Claude's reply is read aloud, then the mic opens again on its own. Back to step 2.
 
-- **◉ Mute** pauses the mic: nothing is recorded while muted, what you already said is kept, and
+- **Mute** pauses the mic: nothing is recorded while muted, what you already said is kept, and
   **Unmute** carries on the same turn.
-- **■ Stop** cuts Claude's voice; the mic opens right away.
-- **✕ End call** stops the mic and the voice. It never cancels work Claude is doing.
-- The controls stay in the same places during a call; the one that matters now lights up, and the
-  status animates (listening, thinking, speaking).
+- **Stop** cuts Claude's voice; the mic opens right away.
+- **End call** stops the mic and the voice. It never cancels work Claude is doing.
+- Only the buttons you can use right now are shown; a small live indicator beside the gear says
+  what is happening (listening, muted, writing, thinking, speaking).
 - **Read aloud** (outside a call) speaks the last reply once.
 - **Listening** uses the system's own speech recognizer, which keeps your words as you said them:
   on a Mac the engine behind macOS dictation (on-device), on Windows the engine behind voice typing.
