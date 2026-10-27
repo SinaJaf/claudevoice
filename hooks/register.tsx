@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ChatSettings, ListenMode, Patience, VoicePhase, VoiceSettings } from '../types'
+import type { ChatSettings, ListenMode, Patience, ReadingState, VoicePhase, VoiceSettings } from '../types'
 
 const SERVER = 'http://127.0.0.1:8765'
 
@@ -32,6 +32,9 @@ const listenMode = atom({ plugin: 'claudevoice', key: 'listenMode' } as const, '
 const talkOver = atom({ plugin: 'claudevoice', key: 'talkOver' } as const, true)
 /** Live mode: how long a pause runs before Claude answers. */
 const patience = atom({ plugin: 'claudevoice', key: 'patience' } as const, 'normal' as Patience)
+// A file or selection being read aloud, as the voice server reports it.
+const NOT_READING: ReadingState = { title: '', at: 0, of: 0, paused: false }
+const reading = atom({ plugin: 'claudevoice', key: 'reading' } as const, NOT_READING)
 const MODE_STORE_KEY = 'callMode'
 const TALK_OVER_STORE_KEY = 'talkOver'
 const PATIENCE_STORE_KEY = 'patience'
@@ -117,10 +120,12 @@ async function ensurePython($: Engine): Promise<boolean> {
 
 // ---- talking to the Kokoro server --------------------------------------------
 
-async function health($: Engine): Promise<{ speaking: boolean; last_error?: string } | null> {
+type Health = { speaking: boolean; last_error?: string; reading?: ReadingState | null }
+
+async function health($: Engine): Promise<Health | null> {
   try {
     const r = await $.http.fetch(`${SERVER}/health`)
-    return r.ok ? (JSON.parse(r.text) as { speaking: boolean; last_error?: string }) : null
+    return r.ok ? (JSON.parse(r.text) as Health) : null
   } catch {
     return null
   }
@@ -137,6 +142,13 @@ async function ensureServer($: Engine): Promise<boolean> {
     return false
   }
   return true
+}
+
+/** Replace a running server with this version's (after an update). */
+async function restartServer($: Engine): Promise<boolean> {
+  await $.process.run([...(await python($)), '-m', 'claudevoice', 'stop-server'], { cwd: root($), timeoutMs: 30000 })
+  for (let i = 0; i < 20 && (await health($)); i++) await new Promise<void>(done => $.clock.after(250, done))
+  return ensureServer($)
 }
 
 // ---- this chat's settings over the all-chats ones ------------------------------------
@@ -213,17 +225,22 @@ async function touch($: Engine, name: string, text = ''): Promise<void> {
   }
 }
 
-async function speak($: Engine, text: string): Promise<boolean> {
-  if (!(await ensureServer($))) return false
-  // This chat's voice and speed, when it has its own; the server uses the config otherwise.
+/** This chat's voice and speed, when it has its own; the server uses the config otherwise. */
+async function voiceFields($: Engine): Promise<Record<string, unknown>> {
   const c = await read($, chat)
-  const body: Record<string, unknown> = { text, interrupt: true }
+  const fields: Record<string, unknown> = {}
   if (c.speaking !== undefined) {
     const [engine, voice] = c.speaking.split(':', 2) as [string, string]
-    body.engine = engine
-    if (voice !== '') body.voice = voice
+    fields.engine = engine
+    if (voice !== '') fields.voice = voice
   }
-  if (c.speed !== undefined) body.speed = Number(c.speed)
+  if (c.speed !== undefined) fields.speed = Number(c.speed)
+  return fields
+}
+
+async function speak($: Engine, text: string): Promise<boolean> {
+  if (!(await ensureServer($))) return false
+  const body = { text, interrupt: true, ...(await voiceFields($)) }
   try {
     const r = await $.http.fetch(`${SERVER}/speak`, {
       method: 'POST',
@@ -277,8 +294,24 @@ function startTicker($: Engine): void {
   step()
 }
 
-/** Read the last reply in this session aloud, once. */
+/** Read aloud what you point at: the text you have selected (in a file you opened, or in
+ *  the chat), else a file named in the prompt box (`@notes.md`, `@guide.pdf`, a path),
+ *  from its start or the lines it names, else Claude's last reply. */
 async function readAloud($: Engine): Promise<void> {
+  const selected = await $.ui.selection().catch(() => undefined)
+  if (selected !== undefined && selected.text.trim() !== '') {
+    await readDocument($, { text: selected.text, title: 'selection' })
+    return
+  }
+  const file = await fileInPrompt($)
+  if (file !== null) {
+    await readDocument($, file)
+    return
+  }
+  await readLastReply($)
+}
+
+async function readLastReply($: Engine): Promise<void> {
   const messages = await $.session.messages()
   const last = [...messages].reverse().find(m => m.role === 'assistant' && m.text.trim() !== '')
   if (!last) {
@@ -290,12 +323,99 @@ async function readAloud($: Engine): Promise<void> {
   watchPlayback($)
 }
 
+type FileToRead = { path: string; start?: number; end?: number }
+
+/** The file the prompt box names: an `@` mention (`@notes.md`, `@"my notes.md"`,
+ *  `@guide.md#L10-40`), or a path that is all the box holds (dragged or pasted in). */
+async function fileInPrompt($: Engine): Promise<FileToRead | null> {
+  const { text } = await $.prompt.read()
+  const named = [...text.matchAll(/@(?:"([^"]+)"|(\S+))/g)].map(m => m[1] ?? m[2] ?? '')
+  const whole = text.trim().replace(/^(["'])(.*)\1$/, '$2').replace(/\\ /g, ' ')
+  if (named.length === 0 && whole !== '' && !whole.includes('\n')) named.push(whole)
+  for (const name of named) {
+    const file = await findFile($, name)
+    if (file !== null) return file
+  }
+  return null
+}
+
+/** `name` as a file on disk, with the lines (or PDF pages) a `#L10-40` suffix asks for. */
+async function findFile($: Engine, name: string): Promise<FileToRead | null> {
+  const range = /#(?:L|page=|p)?(\d+)(?:-L?(\d+))?$/.exec(name)
+  let path = range ? name.slice(0, range.index) : name
+  if (path.startsWith('~/') || path.startsWith('~\\')) path = `${await home($)}${path.slice(1)}`
+  else if (!path.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(path)) path = `${await $.session.cwd()}/${path}`
+  try {
+    if ((await $.fs.stat(path)).kind !== 'file') return null
+  } catch {
+    return null
+  }
+  if (!range) return { path }
+  const start = Number(range[1])
+  return { path, start, end: range[2] !== undefined ? Number(range[2]) : start }
+}
+
+/** Read a file or a piece of text aloud through the server, which keeps its place. */
+async function readDocument($: Engine, what: FileToRead | { text: string; title: string }): Promise<void> {
+  if (!(await ensureServer($))) return
+  let answer: { ok?: boolean; error?: string; title?: string; pages?: number } = {}
+  const body = JSON.stringify({ ...what, ...(await voiceFields($)) })
+  try {
+    let r = await $.http.fetch(`${SERVER}/read`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+    if (r.status === 404 && (await restartServer($))) {
+      // A server started before this update has no /read yet.
+      r = await $.http.fetch(`${SERVER}/read`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+    }
+    answer = JSON.parse(r.text) as typeof answer
+  } catch {
+    answer = { ok: false, error: 'the voice server did not answer' }
+  }
+  if (answer.ok !== true) {
+    $.ui.toast(`Can't read that aloud: ${answer.error ?? 'unknown error'}`)
+    return
+  }
+  const where = 'start' in what && what.start !== undefined
+    ? `${answer.pages ? 'page' : 'line'} ${what.start}${what.end !== undefined && what.end !== what.start ? `–${what.end}` : ''}`
+    : 'the start'
+  $.ui.toast(answer.title === 'selection' ? 'Reading your selection' : `Reading ${answer.title ?? 'the file'} from ${where}`)
+  await update($, reading, () => ({ title: answer.title ?? '', at: 0, of: 0, paused: false }))
+  await setPhase($, 'speaking')
+  watchPlayback($)
+}
+
+/** Pause a reading; Resume carries on from the sentence it stopped in. */
+async function pauseReading($: Engine): Promise<void> {
+  try {
+    await $.http.fetch(`${SERVER}/pause`, { method: 'POST', body: '{}' })
+  } catch {
+    // server gone: nothing is playing
+  }
+}
+
+async function resumeReading($: Engine): Promise<void> {
+  if (!(await ensureServer($))) return
+  try {
+    const r = await $.http.fetch(`${SERVER}/read`, { method: 'POST', body: JSON.stringify({ resume: true }) })
+    if (!r.ok) {
+      await update($, reading, () => NOT_READING)
+      return
+    }
+  } catch {
+    await update($, reading, () => NOT_READING)
+    return
+  }
+  await update($, reading, r => ({ ...r, paused: false }))
+  await setPhase($, 'speaking')
+  watchPlayback($)
+}
+
 /** Poll the server until playback ends; in a call the mic then opens again. */
 function watchPlayback($: Engine): void {
   $.clock.after(300, () => {
     void (async () => {
       if ((await read($, phase)) !== 'speaking') return // a new turn began
       const h = await health($)
+      await update($, reading, () => h?.reading ?? NOT_READING)
       if (h?.speaking) {
         watchPlayback($)
         return
@@ -478,9 +598,10 @@ async function toggleMute($: Engine): Promise<void> {
   await touch($, 'listen.mute', next ? '1' : '0')
 }
 
-/** Stop Claude's voice; in a call the mic opens right away. */
+/** Stop Claude's voice, and forget any reading; in a call the mic opens right away. */
 async function stop($: Engine): Promise<void> {
   await stopSpeaking($) // watchPlayback notices and, in a call, listens again
+  await update($, reading, () => NOT_READING)
 }
 
 // ---- settings ----------------------------------------------------------------------
@@ -593,7 +714,7 @@ async function setEnabled($: Engine, on: boolean): Promise<void> {
 /** The plugin was switched off here: hang up and stop talking. */
 async function quiet($: Engine): Promise<void> {
   if (await read($, isCall)) await endCall($, '')
-  else await stopSpeaking($)
+  else await stop($)
   await setPhase($, 'idle')
 }
 
@@ -604,6 +725,11 @@ type Surface = Parameters<Engine['ui']['resolve']>[0]
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
 const WAVE = ['▁▃▅▃', '▃▅▇▅', '▅▇▅▃', '▇▅▃▁', '▅▃▁▃', '▃▁▃▅'] as const
 
+/** How far a reading has got, as a percentage; empty before the server has said. */
+function progress(r: ReadingState): string {
+  return r.of > 0 ? `${Math.floor((100 * r.at) / r.of)}%` : ''
+}
+
 /** A small live indicator: a glyph and one word, set beside the gear. */
 async function indicator($: Engine, e: Surface) {
   const { Box, Text } = $.ui.resolve(e)
@@ -611,7 +737,16 @@ async function indicator($: Engine, e: Surface) {
   const t = await read($, tick)
   const isMuted = await read($, muted)
   const heardNow = await read($, hearing)
-  if (current === 'idle') return null
+  const r = await read($, reading)
+  if (current === 'idle') {
+    if (r.title === '' || !r.paused) return null
+    return (
+      <Box key="indicator">
+        <Text color="warning">‖</Text>
+        <Text dimColor> paused {progress(r)}</Text>
+      </Box>
+    )
+  }
   const spin = SPINNER[t % SPINNER.length] ?? ''
   const [glyph, color, word] = {
     loading: [spin, 'claude', 'starting'],
@@ -622,7 +757,7 @@ async function indicator($: Engine, e: Surface) {
         : [t % 2 === 0 ? '●' : '○', 'error', 'listening'],
     transcribing: [spin, 'claude', 'writing'],
     thinking: [spin, 'claude', 'thinking'],
-    speaking: [WAVE[t % WAVE.length] ?? '', 'claude', 'speaking'],
+    speaking: [WAVE[t % WAVE.length] ?? '', 'claude', r.title !== '' && !r.paused ? `reading ${progress(r)}`.trim() : 'speaking'],
   }[current]
   return (
     <Box key="indicator">
@@ -639,6 +774,8 @@ async function controls($: Engine, e: Surface, compact: boolean) {
   const inCall = await read($, isCall)
   const lastHeard = await read($, heard)
   const message = await read($, note)
+  const r = await read($, reading)
+  const isReading = !inCall && r.title !== ''
   await read($, chat) // redraw when this chat's settings change
 
   return (
@@ -648,12 +785,15 @@ async function controls($: Engine, e: Surface, compact: boolean) {
         <Box flexGrow={1} />
         {!inCall && <Button key="read" label="Read aloud" hotkey="r" plain onPress={() => void readAloud($)} />}
         {!inCall && <Text> </Text>}
+        {isReading && current === 'speaking' && !r.paused && <Button key="pause" label="Pause" hotkey="p" plain onPress={() => void pauseReading($)} />}
+        {isReading && r.paused && current !== 'speaking' && <Button key="resume" label="Resume" hotkey="p" onPress={() => void resumeReading($)} />}
+        {isReading && <Text> </Text>}
         {inCall && current === 'listening' && <Button key="done" label="Done" hotkey="d" variant="primary" onPress={() => void done($)} />}
         {inCall && current === 'listening' && <Text> </Text>}
         {inCall && current === 'listening' && <Button key="mute" label={(await read($, muted)) ? 'Unmute' : 'Mute'} hotkey="u" plain onPress={() => void toggleMute($)} />}
         {inCall && current === 'listening' && <Text> </Text>}
-        {current === 'speaking' && <Button key="stop" label="Stop" hotkey="s" plain onPress={() => void stop($)} />}
-        {current === 'speaking' && <Text> </Text>}
+        {(current === 'speaking' || (isReading && r.paused)) && <Button key="stop" label="Stop" hotkey="s" plain onPress={() => void stop($)} />}
+        {(current === 'speaking' || (isReading && r.paused)) && <Text> </Text>}
         <Button key="settings" label="⚙" hotkey="g" plain onPress={() => void openSettings($)} />
         <Text> </Text>
         {inCall ? (
@@ -677,6 +817,8 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   const inCall = await read($, isCall)
   const isMuted = await read($, muted)
   const micOpen = inCall && (await read($, take)) !== ''
+  const r = await read($, reading)
+  const isReading = !inCall && r.title !== ''
   const quiet = { dimColor: true, hover: { dimColor: false, scope: 'voice' } } as const
   const lit = { hover: { bold: true, scope: 'voice' } } as const
   const items: JSX.Element[] = []
@@ -689,7 +831,9 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   if (isOn) {
     if (!inCall) add(<Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />)
     if (inCall && current === 'listening') add(<Button key="done" label="Done" plain {...lit} onPress={() => void done($)} />)
-    if (current === 'speaking') add(<Button key="stop" label="Stop" plain {...lit} onPress={() => void stop($)} />)
+    if (isReading && current === 'speaking' && !r.paused) add(<Button key="pause" label="Pause" plain {...lit} onPress={() => void pauseReading($)} />)
+    if (isReading && r.paused && current !== 'speaking') add(<Button key="resume" label="Resume" plain {...lit} onPress={() => void resumeReading($)} />)
+    if (current === 'speaking' || (isReading && r.paused)) add(<Button key="stop" label="Stop" plain {...lit} onPress={() => void stop($)} />)
     // Mute while the mic can hear you: your turn, or Claude speaking with talk-over on.
     if (inCall && (current === 'listening' || (micOpen && current === 'speaking'))) {
       add(<Button key="mute" label={isMuted ? 'Unmute' : 'Mute'} plain {...(isMuted ? lit : quiet)} onPress={() => void toggleMute($)} />)
@@ -850,6 +994,11 @@ async function settingsPane($: Engine, e: Surface) {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'voice-panel', description: 'Open the voice pane (read aloud, call)' })
+    await $.command.register({
+      name: 'read',
+      description: 'Read a file aloud (markdown, text, PDF); a number starts from that line or page',
+      argumentHint: '[file] [line or page]',
+    })
     await update($, isCall, () => false)
     await update($, phase, () => 'idle')
     await update($, take, () => '')
@@ -865,6 +1014,21 @@ export const register: Register = on => {
     const savedChat = await $.store.get(await chatStoreKey($))
     await update($, chat, () => (savedChat !== null && typeof savedChat === 'object' ? (savedChat as ChatSettings) : {}))
     return next(e)
+  })
+
+  // /read notes.md, /read guide.pdf 12 (from page 12); /read alone is the Read aloud button.
+  on('command.run', { command: 'read' }, async ($, e) => {
+    const args = e.args.trim()
+    if (args === '') {
+      await readAloud($)
+      return { text: '' }
+    }
+    const from = /^(.*?)\s+(\d+)$/.exec(args)
+    const name = (from?.[1] ?? args).replace(/^@/, '').replace(/^(["'])(.*)\1$/, '$2')
+    const file = await findFile($, name)
+    if (file === null) return { text: `No file called ${name} here.` }
+    await readDocument($, from ? { path: file.path, start: Number(from[2]) } : file)
+    return { text: '' }
   })
 
   on('command.run', { command: 'voice-panel' }, async $ => {

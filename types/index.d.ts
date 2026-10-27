@@ -19,6 +19,10 @@ export type ChatSettings = {
   speed?: string
 }
 
+/** A file or selection being read aloud: its name, the piece playing (or to resume
+ *  from) of how many, and whether it is paused. An empty title: nothing is being read. */
+export type ReadingState = { title: string; at: number; of: number; paused: boolean }
+
 declare module 'claude-code' {
   interface PluginState {
     'claudevoice': {
@@ -37,6 +41,7 @@ declare module 'claude-code' {
       listenMode: ListenMode
       talkOver: boolean
       patience: Patience
+      reading: ReadingState
     }
   }
 }

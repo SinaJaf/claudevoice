@@ -8,7 +8,13 @@ Endpoints (all on 127.0.0.1):
   POST /speak             -> {"text": str, "voice"?: str, "speed"?: float,
                               "interrupt"?: bool, "wait"?: bool, "raw"?: bool}
                              raw=true skips markdown cleanup.
-  POST /stop              -> cut playback and clear the queue
+  POST /stop              -> cut playback and clear the queue (and forget any reading)
+  POST /read              -> {"path": str, "start"?: int, "end"?: int} or {"text": str, "title"?: str},
+                             plus "voice"/"speed"/"engine"; or {"resume": true}. Reads a file
+                             (markdown, text, PDF) or selected text sentence by sentence,
+                             keeping its place: /health reports "reading" {title, at, of, paused}.
+                             start/end are lines, or pages for a PDF.
+  POST /pause             -> stop reading, keeping the place for {"resume": true}
   POST /synthesize        -> same body as /speak; returns a WAV instead of playing
   POST /shutdown
 """
@@ -31,11 +37,26 @@ import numpy as np
 
 from . import config, devices
 from .clean import markdown_to_speech, split_sentences
+from .document import DocumentError, group, load, prepare_text, split_long
 
 SAMPLE_RATE = 24_000
 BLOCK = 1024  # frames per write; small so /stop takes effect within ~40 ms
 
 log = logging.getLogger("claudevoice.server")
+
+CLOUD_PIECE = 1200  # characters per request when a cloud voice reads a document
+
+
+class Reading:
+    """A document being read: its pieces, and the one playing (or to resume from)."""
+
+    def __init__(self, title: str, pieces: list[str], engine_voice: str, speed: float) -> None:
+        self.title, self.pieces, self.engine_voice, self.speed = title, pieces, engine_voice, speed
+        self.at = 0
+        self.paused = False
+
+    def state(self) -> dict:
+        return {"title": self.title, "at": self.at, "of": len(self.pieces), "paused": self.paused}
 
 
 class Speaker:
@@ -43,7 +64,9 @@ class Speaker:
 
     def __init__(self, cfg: dict) -> None:
         self.cfg = cfg
-        self._queue: "queue.Queue[tuple[int, str, str, float]]" = queue.Queue()
+        # (generation, text, "engine:voice", speed, index into the reading or -1)
+        self._queue: "queue.Queue[tuple[int, str, str, float, int]]" = queue.Queue()
+        self.reading: Reading | None = None
         self._generation = 0  # bumped on /stop; stale queue items are dropped
         self._stop_playback = threading.Event()
         self._idle = threading.Event()
@@ -77,7 +100,7 @@ class Speaker:
     def speak(self, text: str, *, voice: str | None, speed: float | None, interrupt: bool,
               engine: str | None = None) -> int:
         if interrupt:
-            self.stop()
+            self._halt()  # a reading cut off this way can be resumed
         with self._lock:
             gen = self._generation
         # Settings are re-read per request so the voice bar's changes apply at once.
@@ -95,10 +118,57 @@ class Speaker:
         log.info("speak %d chars as %s:%s", len(text), engine, voice)
         self._idle.clear()
         for chunk in chunks:
-            self._queue.put((gen, chunk, f"{engine}:{voice}", speed))
+            self._queue.put((gen, chunk, f"{engine}:{voice}", speed, -1))
         return len(chunks)
 
+    def read(self, title: str, text: str, *, voice: str | None, speed: float | None,
+             engine: str | None = None) -> int:
+        """Read cleaned document text aloud from the start, replacing anything playing."""
+        self.stop()
+        self.cfg = config.load()
+        engine = engine or self.cfg.get("tts_engine", "kokoro")
+        voice = voice or (self.cfg["voice"] if engine == "kokoro" else self.cfg["tts_voice"])
+        speed = float(speed or self.cfg["speed"])
+        pieces = split_long(split_sentences(text))
+        if engine != "kokoro":
+            pieces = group(pieces, CLOUD_PIECE)
+        if not pieces:
+            return 0
+        log.info("read %s: %d chars in %d pieces as %s:%s", title, len(text), len(pieces), engine, voice)
+        self.reading = Reading(title, pieces, f"{engine}:{voice}", speed)
+        self._queue_reading()
+        return len(pieces)
+
+    def pause(self) -> None:
+        self._halt()
+
+    def resume(self) -> bool:
+        if self.reading is None:
+            return False
+        self._halt()
+        self._queue_reading()
+        return True
+
+    def _queue_reading(self) -> None:
+        reading = self.reading
+        if reading is None:
+            return
+        reading.paused = False
+        with self._lock:
+            gen = self._generation
+        self._idle.clear()
+        for i in range(reading.at, len(reading.pieces)):
+            self._queue.put((gen, reading.pieces[i], reading.engine_voice, reading.speed, i))
+
     def stop(self) -> None:
+        """Cut playback and forget any reading."""
+        self._halt()
+        self.reading = None
+
+    def _halt(self) -> None:
+        """Cut playback; a reading keeps its place, paused."""
+        if self.reading is not None:
+            self.reading.paused = True
         with self._lock:
             self._generation += 1
         self._stop_playback.set()
@@ -227,7 +297,7 @@ class Speaker:
         was_idle = True
         while True:
             try:
-                gen, chunk, voice, speed = self._queue.get(timeout=0.1)
+                gen, chunk, voice, speed, index = self._queue.get(timeout=0.1)
             except queue.Empty:
                 if self._queue.empty():
                     self._idle.set()
@@ -237,6 +307,9 @@ class Speaker:
                 if gen != self._generation:
                     continue  # cancelled by /stop while waiting in the queue
                 self._stop_playback.clear()
+                reading = self.reading if index >= 0 else None
+                if reading is not None:
+                    reading.at = index
             try:
                 self._ensure_stream(new_reply=was_idle)
                 was_idle = False
@@ -245,9 +318,11 @@ class Speaker:
                 log.exception(self.last_error)
                 self._stream = None
                 continue
+            interrupted = False
             try:
                 for audio in self._generate(chunk, voice, speed):
                     if self._play(audio):
+                        interrupted = True
                         break
                 self.last_error = ""
             except urllib.error.HTTPError as exc:
@@ -259,6 +334,11 @@ class Speaker:
                 self.last_error = f"{voice.split(':')[0]} speech failed: {exc}"
                 log.exception("synthesis failed for chunk: %r", chunk[:80])
                 self._fallback(chunk, voice, speed)
+            if reading is not None and not interrupted and not self._stop_playback.is_set():
+                if index == len(reading.pieces) - 1 and self.reading is reading:
+                    self.reading = None  # read to the end
+                else:
+                    reading.at = index + 1  # resume after the piece just finished
             # Tiny pause between sentences reads more naturally than butting them together.
             if not self._stop_playback.is_set():
                 try:
@@ -343,12 +423,39 @@ def make_handler(speaker: Speaker, cfg: dict):
             except json.JSONDecodeError:
                 return {}
 
+        def _read(self, body: dict) -> None:
+            if body.get("resume"):
+                ok = speaker.resume()
+                self._json(200 if ok else 409, {"ok": ok, "reading": speaker.reading.state() if speaker.reading else None,
+                                                "error": "" if ok else "nothing to resume"})
+                return
+            try:
+                if body.get("path"):
+                    start, end = body.get("start"), body.get("end")
+                    doc = load(str(body["path"]), start=int(start) if start else None, end=int(end) if end else None)
+                    title, text, pages = doc.title, doc.text, doc.pages
+                else:
+                    title, text, pages = str(body.get("title") or "selection"), prepare_text(str(body.get("text", ""))), 0
+            except DocumentError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+                return
+            except Exception as exc:  # noqa: BLE001 - say what went wrong rather than drop the request
+                log.exception("could not read %s", body.get("path") or "the text")
+                self._json(500, {"ok": False, "error": f"could not read it: {exc}"})
+                return
+            n = speaker.read(title, text, voice=body.get("voice"), speed=body.get("speed"), engine=body.get("engine"))
+            if n == 0:
+                self._json(400, {"ok": False, "error": f"{title} has nothing to read"})
+                return
+            self._json(200, {"ok": True, "title": title, "pieces": n, "pages": pages})
+
         def do_GET(self):
             if self.path == "/health":
                 live = config.load()
                 self._json(200, {"ok": True, "speaking": speaker.speaking, "voice": live["voice"],
                                  "engine": live.get("tts_engine", "kokoro"), "last_error": speaker.last_error,
-                                 "output_device": speaker.output_device})
+                                 "output_device": speaker.output_device,
+                                 "reading": speaker.reading.state() if speaker.reading else None})
             else:
                 self._json(404, {"error": "not found"})
 
@@ -371,6 +478,11 @@ def make_handler(speaker: Speaker, cfg: dict):
             elif self.path == "/stop":
                 speaker.stop()
                 self._json(200, {"ok": True})
+            elif self.path == "/read":
+                self._read(body)
+            elif self.path == "/pause":
+                speaker.pause()
+                self._json(200, {"ok": True, "reading": speaker.reading.state() if speaker.reading else None})
             elif self.path == "/synthesize":
                 text = body.get("text", "")
                 if not body.get("raw"):

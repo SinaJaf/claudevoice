@@ -9,6 +9,9 @@ from __future__ import annotations
 import re
 
 _CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_EMPTY_LINK = re.compile(r"\[\s*\]\([^)]*\)")
 _INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _BARE_URL = re.compile(r"https?://\S+")
@@ -32,13 +35,21 @@ _EMOJI = re.compile(
 _MULTI_SPACE = re.compile(r"[ \t]+")
 _SPACE_BEFORE_PUNCT = re.compile(r"[ \t]+([.,!?;:])")
 _MULTI_NEWLINE = re.compile(r"\n{3,}")
-# Absolute, home-relative, or relative paths with at least one directory segment.
-# Segments must start with a letter, dot or underscore so "3/4" is left alone.
-_PATH = re.compile(r"(?<![\w/])(?:~|\.{1,2})?/?(?:[A-Za-z_.][\w.\-]*/)+[\w.\-]+")
+# Paths, read by their last part: absolute or home-relative ones, ones with two or more
+# directories, and dir/file.ext. A single slash between words ("and/or", "km/s") is no
+# path; segments must start with a letter, dot or underscore so "3/4" is left alone.
+_PATH = re.compile(
+    r"(?<![\w/])(?:"
+    r"(?:~|\.{1,2})?/(?:[\w.\-]+/)*[\w.\-]+"
+    r"|(?:[A-Za-z_.][\w.\-]*/){2,}[\w.\-]+"
+    r"|(?:[A-Za-z_.][\w.\-]*/)+[\w\-]+\.[A-Za-z]\w{0,4}\b"
+    r")"
+)
 _FILE_LINE = re.compile(r"(\b[\w.\-]+\.(?:py|ts|tsx|js|jsx|rs|go|rb|md|json|toml|yaml|yml|sh|c|cpp|h|swift)):(\d+)\b")
 
 # Short spoken replacements for symbols Kokoro would otherwise skip or mangle.
 _SYMBOLS = [
+    (re.compile(r"\b(and)/(or)\b", re.IGNORECASE), r"\1 \2"),
     (re.compile(r"\s*->\s*"), " to "),
     (re.compile(r"\s*=>\s*"), " gives "),
     (re.compile(r"\s*&&\s*"), " and "),
@@ -87,6 +98,9 @@ def markdown_to_speech(text: str, *, max_chars: int | None = None) -> str:
         return ""
     out = text
     out = _CODE_FENCE.sub(_replace_code_fence, out)
+    out = _HTML_COMMENT.sub("", out)
+    out = _IMAGE.sub("", out)
+    out = _EMPTY_LINK.sub("", out)
     out = _TABLE_RULE.sub("", out)
     out = _TABLE_ROW.sub(_table_row_to_speech, out)
     out = _LINK.sub(r"\1", out)

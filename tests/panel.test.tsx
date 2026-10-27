@@ -1,3 +1,4 @@
+import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
 const BAND = {
@@ -9,8 +10,10 @@ const BAND = {
 
 type Fetch = { url: string; body: string }
 
+type Reading = { title: string; at: number; of: number; paused: boolean } | null
+
 /** The world beneath the mod: a running Kokoro server, a session with one reply. */
-function world(on: Parameters<Parameters<typeof test>[1]>[1], state: { speaking: boolean }) {
+function world(on: On, state: { speaking: boolean; reading?: Reading }) {
   const fetches: Fetch[] = []
   const runs: string[][] = []
   const submitted: string[] = []
@@ -30,10 +33,36 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], state: { speaking:
     ],
   }))
   on('http.fetch', (_, e) => {
-    fetches.push({ url: e.url, body: e.init?.body ?? '' })
-    if (e.url.endsWith('/speak')) state.speaking = true
-    if (e.url.endsWith('/stop')) state.speaking = false
-    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ ok: true, speaking: state.speaking }) } }
+    const body = e.init?.body ?? ''
+    fetches.push({ url: e.url, body })
+    let answer: Record<string, unknown> = { ok: true }
+    if (e.url.endsWith('/speak')) {
+      state.speaking = true
+      if (state.reading) state.reading = { ...state.reading, paused: true } // a reply cuts in
+    }
+    if (e.url.endsWith('/stop')) {
+      state.speaking = false
+      state.reading = null
+    }
+    // The server reads a file or a selection, and keeps its place.
+    if (e.url.endsWith('/read')) {
+      const asked = JSON.parse(body) as { path?: string; resume?: boolean }
+      if (asked.resume) {
+        if (!state.reading) return { value: { status: 409, ok: false, headers: {}, text: JSON.stringify({ ok: false, error: 'nothing to resume' }) } }
+        state.reading = { ...state.reading, paused: false }
+      } else {
+        const title = asked.path?.split('/').pop() ?? 'selection'
+        state.reading = { title, at: 0, of: 40, paused: false }
+        answer = { ok: true, title, pieces: 40, pages: title.endsWith('.pdf') ? 12 : 0 }
+      }
+      state.speaking = true
+    }
+    if (e.url.endsWith('/pause')) {
+      state.speaking = false
+      if (state.reading) state.reading = { ...state.reading, at: 10, paused: true }
+    }
+    if (e.url.endsWith('/health')) answer = { ok: true, speaking: state.speaking, reading: state.reading ?? null }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(answer) } }
   })
   const results = new Map<string, string>()
   // The listener answers through its --result file: at once ('now', as when Smart Turn
@@ -67,12 +96,21 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], state: { speaking:
     submitted.push(e.text)
     return { text: e.text }
   })
-  on('turn.start', () => ({}))
+  on('turn.start', () => ({ turnId: 't0' }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   on('ui.toast', () => ({ value: undefined }))
   // The machine beneath: a venv already set up, a home folder.
   const answered = (path: string) => results.has(path) && (listener.answer === 'now' || listener.done)
   on('fs.exists', (_, e) => ({ value: e.path.endsWith('/.venv/bin/python') || answered(e.path) }))
+  // The project's files, and what is selected on screen.
+  const files = new Set(['/proj/notes.md', '/proj/docs/guide.pdf', '/home/tester/my notes.md'])
+  on('fs.stat', (_, e) => {
+    if (!files.has(e.path)) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
+    return { value: { kind: 'file' as const, size: 100, mtimeMs: 0, isLink: false } }
+  })
+  on('session.cwd', () => ({ value: '/proj' }))
+  const selection = { text: '' }
+  on('ui.selection', () => ({ value: selection.text === '' ? undefined : { text: selection.text } }))
   on('fs.read', (_, e) => ({ value: results.get(e.path) ?? '' }))
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/tester' : undefined }))
   on('fs.write', (_, e) => {
@@ -81,7 +119,7 @@ function world(on: Parameters<Parameters<typeof test>[1]>[1], state: { speaking:
     writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, writes, opened, box, listener }
+  return { fetches, runs, submitted, written, writes, opened, box, listener, selection }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -346,4 +384,111 @@ test('A setting chosen for this chat only overrides the all-chats one here', asy
   expect(read.speed).toBe(1.25)
   await bar.unmount()
   await again.unmount()
+})
+
+const readBody = (w: { fetches: Fetch[] }) => JSON.parse(w.fetches.filter(f => f.url.endsWith('/read')).pop()?.body ?? '{}') as Record<string, unknown>
+
+test('Read aloud reads your selection, else a file named in the prompt box, else the last reply', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...BAND, surface })
+    // Text selected in a file you opened: that is what is read.
+    w.selection.text = 'The second section, as selected.'
+    await ui.press({ key: 'read' })
+    expect(readBody(w)).toEqual({ text: 'The second section, as selected.', title: 'selection' })
+    await ui.press({ key: 'stop' })
+    await clock.advance(400)
+
+    // Nothing selected, a file mentioned in the box: the file from its start.
+    w.selection.text = ''
+    w.box.text = 'read this @notes.md please'
+    await ui.press({ key: 'read' })
+    expect(readBody(w)).toEqual({ path: '/proj/notes.md' })
+    await ui.press({ key: 'stop' })
+    await clock.advance(400)
+
+    // A mention with lines, a quoted one with spaces, a dragged-in path.
+    w.box.text = '@docs/guide.pdf#L3-5'
+    await ui.press({ key: 'read' })
+    expect(readBody(w)).toEqual({ path: '/proj/docs/guide.pdf', start: 3, end: 5 })
+    await ui.press({ key: 'stop' })
+    w.box.text = '@"~/my notes.md"'
+    await ui.press({ key: 'read' })
+    expect(readBody(w).path).toBe('/home/tester/my notes.md')
+    await ui.press({ key: 'stop' })
+    w.box.text = '/proj/notes.md'
+    await ui.press({ key: 'read' })
+    expect(readBody(w).path).toBe('/proj/notes.md')
+    await ui.press({ key: 'stop' })
+    await clock.advance(400)
+
+    // A prompt that names no file: the last reply, as before.
+    w.box.text = 'fix the failing test'
+    w.fetches.length = 0
+    await ui.press({ key: 'read' })
+    expect(w.fetches.some(f => f.url.endsWith('/read'))).toBe(false)
+    expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('Hello **there**, friend.')
+    await ui.press({ key: 'stop' })
+    await clock.advance(400)
+    w.box.text = ''
+    await ui.unmount()
+  }
+})
+
+test('A reading can be paused and resumed where it stopped; Stop forgets it', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  w.box.text = '@notes.md'
+  await ui.press({ key: 'read' })
+  await clock.advance(400)
+  expect(await ui.find({ type: 'Text', text: /reading 0%/ })).toBeDefined()
+  expect(await ui.find({ key: 'pause' })).toBeDefined()
+  expect(await ui.find({ key: 'resume' })).toBeUndefined()
+
+  // Pause: the voice stops, the place is kept, Resume and Stop are offered.
+  await ui.press({ key: 'pause' })
+  await clock.advance(400)
+  expect(await ui.find({ type: 'Text', text: /paused 25%/ })).toBeDefined()
+  expect(await ui.find({ key: 'pause' })).toBeUndefined()
+  expect(await ui.find({ key: 'resume' })).toBeDefined()
+  expect(await ui.find({ key: 'stop' })).toBeDefined()
+
+  // Resume: the server carries on from its place.
+  await ui.press({ key: 'resume' })
+  expect(readBody(w)).toEqual({ resume: true })
+  await clock.advance(400)
+  expect(await ui.find({ type: 'Text', text: /reading 25%/ })).toBeDefined()
+
+  // Stop: the reading is gone; Read aloud is there for the next one.
+  await ui.press({ key: 'stop' })
+  await clock.advance(400)
+  expect(await ui.find({ key: 'resume' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /paused|reading/ })).toBeUndefined()
+  expect(await ui.find({ key: 'read' })).toBeDefined()
+  await ui.unmount()
+})
+
+const TYPED = { origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 100 } }
+
+test('/read names a file, and a number starts from that line or page', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  await $.command.run({ ...TYPED, command: 'read', args: 'docs/guide.pdf 7' })
+  expect(readBody(w)).toEqual({ path: '/proj/docs/guide.pdf', start: 7 })
+  await $.command.run({ ...TYPED, command: 'read', args: '@notes.md' })
+  expect(readBody(w)).toEqual({ path: '/proj/notes.md' })
+  const missing = await $.command.run({ ...TYPED, command: 'read', args: 'nowhere.md' })
+  expect(missing.text).toContain('No file called nowhere.md')
 })

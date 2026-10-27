@@ -10,6 +10,8 @@ any time. It all runs on your computer.
 
 - **Just talk.** Pause to think as long as you like; Claude answers when you sound finished.
 - **Cut in.** Start talking while Claude speaks, and it stops to listen.
+- **Read files aloud.** Select part of a markdown, text or PDF file, or name the file, and press
+  **Read aloud**. Pause and pick up where you left off.
 - **Private and free.** Listening and speaking run on your computer, with no extra account or API key.
 
 ## Get started
@@ -40,13 +42,34 @@ now are shown, and a small indicator beside the gear says what is happening.
 - **Mute** pauses the mic. Nothing is recorded while muted, and what you already said is kept.
 - **Stop** cuts Claude's voice. Talking over it does the same.
 - **End call** stops the mic and the voice. It never cancels work Claude is doing.
-- **Read aloud** (outside a call) speaks the last reply once.
+- **Read aloud** (outside a call) speaks the last reply once, or a file ([below](#reading-files-aloud)).
 - Switch headphones, speakers or microphones whenever you like: the voice and the mic follow your
   system's current devices, even mid-turn.
 
 How it knows you've finished: [Smart Turn](https://github.com/pipecat-ai/smart-turn) listens to how
 you speak, not only to silence. So "so what I want is..." or an "um" keeps the turn yours, while a
 finished sentence ends it after a short pause. A long pause ends it anyway, and **Done** ends it at once.
+
+## Reading files aloud
+
+**Read aloud** reads what you point it at, in this order:
+
+1. **Text you've selected.** Highlight a section of a file you have open, or of the chat, and press
+   **Read aloud**.
+2. **A file named in the prompt box.** With nothing selected, type `@` and pick the file
+   (`@notes.md`, `@report.pdf`), then press **Read aloud** to hear it from the start.
+   `@notes.md#L40-80` reads just those lines. A path dragged into the box works too.
+3. **Otherwise**, Claude's last reply.
+
+While a file is being read, **Pause** keeps your place, **Resume** carries on from the sentence you
+paused in, and **Stop** ends it. The indicator by the gear shows how far it has got.
+
+You can also type `/read notes.md`, or `/read report.pdf 12` to start at page 12 (for a text file,
+the number is a line).
+
+Markdown, plain text and PDF work. Headings, lists and tables are read as sentences, code blocks
+are announced rather than spelled out, and a PDF's page numbers, running headers and footers are
+skipped. A scanned PDF (pictures of pages) has no text to read.
 
 ---
 
@@ -159,7 +182,9 @@ Claude Code (any surface)
   note Claude receives during calls. It also routes the app's built-in speech calls through the chosen speaking engine.
 - `claudevoice/` is the Python side, run through the project's `uv` environment:
   `tts_server.py` keeps Kokoro loaded and plays audio, following the system's output device;
-  `clean.py` turns
+  `document.py` turns a file or a selection into text to read (PDFs through PDFium: lines
+  joined back into paragraphs, broken words mended, headers and page numbers dropped), and the
+  server reads it sentence by sentence, keeping its place for Pause and Resume; `clean.py` turns
   markdown into speakable text (code fences become "python code block, 12 lines", paths collapse
   to file names, `app.py:42` reads as "app.py line 42").
 - `listen.py` runs one turn and transcribes it. `live.py` is live mode: Silero VAD hears speech,
@@ -213,4 +238,5 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 
 MIT. The models it downloads keep their own licenses: Kokoro-82M (Apache-2.0, hexgrad),
 Parakeet TDT 0.6B v2 and v3 (CC-BY-4.0, NVIDIA; ONNX export by istupakov, run with onnx-asr),
-Smart Turn v3.2 (BSD-2-Clause, Daily / Pipecat) and Silero VAD (MIT, Silero Team).
+Smart Turn v3.2 (BSD-2-Clause, Daily / Pipecat) and Silero VAD (MIT, Silero Team). PDFs are read
+with pypdfium2 (Apache-2.0 or BSD-3-Clause) and PDFium (BSD-3-Clause).
