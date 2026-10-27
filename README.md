@@ -2,7 +2,7 @@
 
 **Talk with Claude Code, and hear it talk back.** A live, hands-free voice conversation right inside
 your Claude Code chat: you speak, Claude answers out loud when you've finished, and you can cut in
-any time. It all runs on your computer.
+any time. It reads your files aloud too. It all runs on your computer.
 
 <p align="center">
   <img src="docs/images/footer.png" width="640" alt="The Claude Code prompt box. On the right of its footer, claudevoice adds Read aloud, a settings gear and a Call button.">
@@ -189,9 +189,11 @@ Claude Code (any surface)
   prompt footer controls  ──$.http──▶  claudevoice server (Kokoro, warm, 127.0.0.1:8765)
   ● Call: mic ─▶ VAD + Smart Turn ─▶ Parakeet ─▶ prompt ─▶ reply ─▶ speak   └─ speakers
           (the mic stays open while Claude speaks: talking over it stops the voice)
+  Read aloud: copied text, chat selection, @file or last reply ─▶ /read, sentence by sentence
 ```
 
-- `hooks/register.tsx` is the Claude Code plugin: the footer controls, the settings dialog, the
+- `hooks/register.tsx` is the Claude Code plugin: the footer controls, the settings dialog, Read
+  aloud (what you copied, the chat selection, a file named in the box, or the last reply), the
   call loop (a detached listener per turn, `$.prompt.submit`, `turn.complete`), and a spoken-style
   note Claude receives during calls. It also routes the app's built-in speech calls through the chosen speaking engine.
 - `claudevoice/` is the Python side, run through the project's `uv` environment:
