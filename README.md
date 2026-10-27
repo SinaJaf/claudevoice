@@ -1,54 +1,103 @@
 # claudevoice
 
-Voice for [Claude Code](https://claude.com/claude-code): a live, one-on-one spoken conversation with
-Claude, right inside the chat. Just talk. Claude answers out loud when you've finished, in a natural
-local voice ([Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)), and you can cut in while it
-talks. Everything runs on your computer.
+**Talk with Claude Code, and hear it talk back.** A live, hands-free voice conversation right inside
+your Claude Code chat: you speak, Claude answers out loud when you've finished, and you can cut in
+any time. It all runs on your computer.
 
-```
-Auto · Read aloud · ⚙ · ● Call               ← idle, in the prompt footer
-Done · Mute · ◉ hearing you ⚙ · End call     ← your turn
-Stop · Mute · ▃▅▇▅ speaking ⚙ · End call     ← Claude talking (talk over it to cut in)
-```
+<p align="center">
+  <img src="docs/images/footer.png" width="640" alt="The Claude Code prompt box. Under it, claudevoice adds Read aloud, a settings gear and a Call button.">
+</p>
 
-How a call goes:
+- **Just talk.** Pause to think as long as you like; Claude answers when you sound finished.
+- **Cut in.** Start talking while Claude speaks, and it stops to listen.
+- **Private and free.** Listening and speaking run on your computer, with no extra account or API key.
 
-1. **● Call** starts it. Claude says it's listening.
-2. Talk. Pause to think mid-sentence as often as you like: Claude waits until you sound finished.
-3. Claude's reply is read aloud. Start talking and it stops to listen. Back to step 2.
+## Get started
+
+1. **Install [uv](https://docs.astral.sh/uv/)**, once per computer:
+   `curl -LsSf https://astral.sh/uv/install.sh | sh` ([Windows and Linux notes](#install-in-detail)).
+2. **Add the plugin.** In the Claude Code desktop app: **+** next to the prompt, **Plugins**,
+   **Add marketplace** `SinaJaf/claudevoice`, then **Add plugin**.
+3. **Press ● Call** under the prompt box and start talking. The first call sets itself up, which
+   takes a few minutes once.
+
+## How it works
+
+<p align="center">
+  <img src="docs/images/how.png" alt="You talk, Silero VAD hears speech, Smart Turn decides whether you have finished, Parakeet writes it down, Claude answers, and Kokoro speaks the answer. Talking over Claude stops it.">
+</p>
+
+## A call, step by step
+
+The controls live in the prompt footer and change with the call. Only the buttons you can use right
+now are shown, and a small indicator beside the gear says what is happening.
+
+<p align="center">
+  <img src="docs/images/call.png" alt="Seven footer states: idle with Call; Claude speaking with Stop and Mute; your turn with Done and Mute, listening; hearing you; muted; writing it down; Claude thinking.">
+</p>
+
+- **Done** sends what you said right away, without waiting for the pause.
+- **Mute** pauses the mic. Nothing is recorded while muted, and what you already said is kept.
+- **Stop** cuts Claude's voice. Talking over it does the same.
+- **End call** stops the mic and the voice. It never cancels work Claude is doing.
+- **Read aloud** (outside a call) speaks the last reply once.
+- Switch headphones, speakers or microphones whenever you like: the voice and the mic follow your
+  system's current devices, even mid-turn.
 
 How it knows you've finished: [Smart Turn](https://github.com/pipecat-ai/smart-turn) listens to how
-you speak, not only to silence, so "so what I want is..." and an "um" keep the turn yours, while a
+you speak, not only to silence. So "so what I want is..." or an "um" keeps the turn yours, while a
 finished sentence ends it after a short pause. A long pause ends it anyway, and **Done** ends it at once.
 
-- **Mute** pauses the mic: nothing is recorded while muted, what you already said is kept.
-- **Stop** cuts Claude's voice; talking over it does the same.
-- **End call** stops the mic and the voice. It never cancels work Claude is doing.
-- **Hold mode** (in the gear): Claude waits for **Done** instead of listening for the end of your turn.
-- Only the buttons you can use right now are shown; a small indicator beside the gear says what is
-  happening (listening, hearing you, writing, thinking, speaking).
-- **Read aloud** (outside a call) speaks the last reply once.
-- **Listening** uses NVIDIA's [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) on your
-  computer, on macOS, Windows and Linux: accurate, punctuated, steady over long talk, about a second
-  for a minute of speech. The Mac's and Windows' own recognizers, Whisper and OpenAI's cloud
-  transcription are options in the gear.
-- Switch headphones, speakers or microphones whenever you like: the voice and the mic follow the
-  system's current devices, even mid-turn.
-- **⚙** settings: the plugin switch, live or hold, how long a pause runs before Claude answers
-  (Short, Normal, Long, then Long ×2 up to Long ×10, which waits 5 minutes of silence), talk-over,
-  listening engine, microphone, voice and speed. Off leaves only the gear.
-- **Per-chat settings**: under each setting, open **▸ this chat** to choose a different value for the
-  chat you're in. Pick **Same as all chats** to go back to the shared setting.
+---
 
-## Install
+## Settings
 
-**1. Install uv** (once per computer; it brings its own Python, nothing else to set up):
+<img src="docs/images/settings.png" width="460" align="right" alt="The voice settings panel, with a 'this chat' dropdown opened under the pause setting.">
+
+Open them with the **⚙** in the footer. Every choice applies to all chats; open **▸ this chat** under
+a setting to choose a different value for the chat you're in, and **Same as all chats** to go back.
+
+- **Voice plugin**: on, or off (off leaves only the gear, to turn it back on).
+- **When you talk**: *Live* answers when you've finished; *Hold* waits for **Done**.
+- **Pause before Claude answers**: Short, Normal, Long, then Long ×2 up to Long ×10 for long
+  thinking pauses (Long ×10 waits 5 minutes of silence). A change applies even mid-turn.
+- **Talk over Claude**: on with headphones; turn it off on speakers if Claude's own voice interrupts it.
+- **Listening**: NVIDIA [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) on your
+  computer (default; English, or 25 European languages), the Mac's or Windows' own recognizer,
+  Whisper (installed when you pick it), or OpenAI's cloud transcription.
+- **Microphone**, **Speaking** (Kokoro voices, or OpenAI and ElevenLabs cloud voices) and **Speed**.
+
+<br clear="right">
+
+### The config file
+
+The gear covers the common ones. Everything is in `~/.claudevoice/config.json`, also editable with
+`uv run --project <plugin folder> python -m claudevoice config KEY VALUE`:
+
+| key | default | meaning |
+|-----|---------|---------|
+| `voice` | `af_heart` | Kokoro voice, or a comma blend (`af_heart,af_bella`); see the model's VOICES.md |
+| `lang_code` | `a` | `a` American, `b` British (Kokoro) |
+| `speed` | `1.05` | playback pace |
+| `stt_engine` | `auto` | `parakeet` (the `auto` default), `apple` (Mac), `windows` (Windows), `local` (Whisper), `openai` |
+| `parakeet_model` | `v2` | `v2` English (most accurate for English), `v3` 25 European languages |
+| `stt_language` | `` | language for the apple and windows engines (`en-US`, `fa-IR`...); empty follows the system |
+| `whisper_model` | `large-v3-turbo` | `small`, `medium`, `large-v3-turbo`, `large-v3` |
+| `input_device` | `` (system default) | microphone name; empty follows the system's input as it changes |
+| `tts_engine` | `kokoro` | `kokoro`, `openai`, `elevenlabs` |
+| `tts_voice`, `tts_model`, `tts_base_url`, `tts_api_key_env` | OpenAI defaults | cloud speech (ElevenLabs voice id goes in `tts_voice`) |
+| `max_chars` | `2500` | longest reply read in full |
+| `port` | `8765` | local server port |
+
+## Install in detail
+
+**1. Install uv** (once per computer; it brings its own Python, nothing else to set up). macOS and Linux:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-On Windows, in PowerShell:
+Windows, in PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
@@ -73,7 +122,7 @@ Everything lives under the plugin folder, `~/.claudevoice/` and the Hugging Face
 
 Nothing else is needed: no espeak-ng (it ships inside the packages), no Xcode tools, no GPU drivers.
 
-### Where it runs
+## Where it runs
 
 Everything runs on the processor (CPU), so any graphics card (NVIDIA, AMD, Intel, Apple) or none
 works the same. Every package installs from a ready-made build; nothing is compiled on your machine.
@@ -89,14 +138,14 @@ works the same. Every package installs from a ready-made build; nothing is compi
 Memory: about 1.5 GB during a call, up to about 2.5 GB while writing down an hour-long turn.
 Speed on an Apple M-series laptop: a minute of speech is written down in about a second.
 
-### Long talks
+## Long talks
 
 One turn can run up to an hour; at an hour it is sent and the mic keeps listening for the next.
 Long pauses are squeezed out before writing it down, and long turns are written down in pieces cut
 at quiet moments. Tested: a one-hour talk with pauses came back as 4,861 of 4,861 words with two small
 errors (0.04%), written down in 24 seconds.
 
-## How it works
+## Under the hood
 
 ```
 Claude Code (any surface)
@@ -125,33 +174,12 @@ Claude Code (any surface)
   are read from `OPENAI_API_KEY` / `ELEVENLABS_API_KEY` in your environment or login shell; nothing
   secret is written to disk. If a cloud voice can't be used, Kokoro says why and reads the reply.
 
-## Settings
-
-The gear covers the common ones. Everything is in `~/.claudevoice/config.json`, also editable with
-`uv run --project <plugin folder> python -m claudevoice config KEY VALUE`:
-
-| key | default | meaning |
-|-----|---------|---------|
-| `voice` | `af_heart` | Kokoro voice, or a comma blend (`af_heart,af_bella`); see the model's VOICES.md |
-| `lang_code` | `a` | `a` American, `b` British (Kokoro) |
-| `speed` | `1.05` | playback pace |
-| `stt_engine` | `auto` | `parakeet` (the `auto` default), `apple` (Mac), `windows` (Windows), `local` (Whisper), `openai` |
-| `parakeet_model` | `v2` | `v2` English (most accurate for English), `v3` 25 European languages |
-| `stt_language` | `` | language for the apple and windows engines (`en-US`, `fa-IR`...); empty follows the system |
-| `whisper_model` | `large-v3-turbo` | `small`, `medium`, `large-v3-turbo`, `large-v3` |
-| `input_device` | `` (system default) | microphone name; empty follows the system's input as it changes |
-| `tts_engine` | `kokoro` | `kokoro`, `openai`, `elevenlabs` |
-| `tts_voice`, `tts_model`, `tts_base_url`, `tts_api_key_env` | OpenAI defaults | cloud speech (ElevenLabs voice id goes in `tts_voice`) |
-| `max_chars` | `2500` | longest reply read in full |
-| `port` | `8765` | local server port |
-
-
 ## Extras (macOS and Linux)
 
 `./install.sh` front-loads the downloads and installs a `claudevoice` command:
 
-- `claudevoice chat`: a terminal speech-to-speech loop around `claude -p` (Whisper → Claude →
-  Kokoro, streamed sentence by sentence; needs the `claude` CLI logged in).
+- `claudevoice chat`: a terminal speech-to-speech loop around `claude -p` (your listening engine →
+  Claude → Kokoro, streamed sentence by sentence; needs the `claude` CLI logged in).
 - `claudevoice say "text" [--voice bm_george]`, `claudevoice voices`, `claudevoice stop-server`.
 - `CLAUDEVOICE_ALWAYS_ON_HOOKS=1 ./install.sh` registers optional Stop/UserPromptSubmit hooks
   that read *every* reply aloud; `claudevoice on` / `off` toggles them.

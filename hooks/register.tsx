@@ -690,7 +690,8 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
     if (!inCall) add(<Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />)
     if (inCall && current === 'listening') add(<Button key="done" label="Done" plain {...lit} onPress={() => void done($)} />)
     if (current === 'speaking') add(<Button key="stop" label="Stop" plain {...lit} onPress={() => void stop($)} />)
-    if (micOpen || (inCall && current === 'listening')) {
+    // Mute while the mic can hear you: your turn, or Claude speaking with talk-over on.
+    if (inCall && (current === 'listening' || (micOpen && current === 'speaking'))) {
       add(<Button key="mute" label={isMuted ? 'Unmute' : 'Mute'} plain {...(isMuted ? lit : quiet)} onPress={() => void toggleMute($)} />)
     }
   }
