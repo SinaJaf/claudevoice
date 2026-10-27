@@ -5,7 +5,7 @@ your Claude Code chat: you speak, Claude answers out loud when you've finished, 
 any time. It all runs on your computer.
 
 <p align="center">
-  <img src="docs/images/footer.png" width="640" alt="The Claude Code prompt box. Under it, claudevoice adds Read aloud, a settings gear and a Call button.">
+  <img src="docs/images/footer.png" width="640" alt="The Claude Code prompt box. On the right of its footer, claudevoice adds Read aloud, a settings gear and a Call button.">
 </p>
 
 - **Just talk.** Pause to think as long as you like; Claude answers when you sound finished.
@@ -31,17 +31,20 @@ any time. It all runs on your computer.
 
 ## A call, step by step
 
-The controls live in the prompt footer and change with the call. Only the buttons you can use right
-now are shown, and a small indicator beside the gear says what is happening.
+The controls sit on the right of the prompt footer and change with the call. Only the buttons you
+can use right now are shown. The gear doubles as the live indicator: a moving bar while Claude
+speaks, a dot while it listens (◉ once it hears you), and a word while it starts, writes down what
+you said, or thinks.
 
 <p align="center">
-  <img src="docs/images/call.png" alt="Seven footer states: idle with Call; Claude speaking with Stop and Mute; your turn with Done and Mute, listening; hearing you; muted; writing it down; Claude thinking.">
+  <img src="docs/images/call.png" width="640" alt="Seven footer states: Read aloud, gear and Call; Claude speaking with Stop, Mute, a bar by the gear and End; your turn with Done, Mute, a dot by the gear and End; hearing you; muted with Unmute; writing it down; Claude thinking.">
 </p>
 
 - **Done** sends what you said right away, without waiting for the pause.
 - **Mute** pauses the mic. Nothing is recorded while muted, and what you already said is kept.
 - **Stop** cuts Claude's voice. Talking over it does the same.
-- **End call** stops the mic and the voice. It never cancels work Claude is doing.
+- **End call** (**End** in the desktop app, where the footer is narrow) stops the mic and the voice.
+  It never cancels work Claude is doing.
 - **Read aloud** (outside a call) speaks the last reply once, or a file ([below](#reading-files-aloud)).
 - Switch headphones, speakers or microphones whenever you like: the voice and the mic follow your
   system's current devices, even mid-turn.
@@ -63,11 +66,17 @@ finished sentence ends it after a short pause. A long pause ends it anyway, and 
    A path dragged into the box works too.
 4. **Otherwise**, Claude's last reply.
 
+<p align="center">
+  <img src="docs/images/read.png" width="640" alt="Reading a file aloud: Read aloud, then Pause and Stop with a bar and 12% by the gear while it reads, then Resume and Stop with 25% once paused.">
+</p>
+
 Why copy in the Files pane: the app tells plugins what you've highlighted in the chat, but not in
 the Files pane, and not which file is open there.
 
 While a file is being read, **Pause** keeps your place, **Resume** carries on from the sentence you
-paused in, and **Stop** ends it. The indicator by the gear shows how far it has got.
+paused in, and **Stop** ends it. The gear shows how far it has got. **Call** steps aside while a
+file is being read, to keep the footer short; **Stop** brings it back. If Claude starts talking or
+you start a call, the reading pauses instead of being lost.
 
 You can also type `/read notes.md`, or `/read report.pdf 12` to start at page 12 (for a text file,
 the number is a line).
@@ -227,6 +236,10 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 ## Troubleshooting
 
 - Logs: `~/.claudevoice/server.log` (speech) and `~/.claudevoice/claudevoice.log` (hooks).
+- **Read aloud** read something you copied earlier: it reads anything copied since you last
+  pressed it. Press **Stop**, then **Read aloud** again for Claude's reply.
+- The footer ends in "…": the app gives it a fixed width and cuts what doesn't fit. Hover over it
+  to see the whole row, or widen the window.
 - "speech recognition is not allowed": turn on **Claude Voice transcription** in System Settings,
   Privacy & Security, Speech Recognition.
 - Windows: "turn on Online speech recognition": Windows Settings, Privacy & security, Speech. The

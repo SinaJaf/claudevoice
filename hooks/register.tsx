@@ -908,6 +908,7 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
       add(<Button key="mute" label={isMuted ? 'Unmute' : 'Mute'} plain {...(isMuted ? lit : quiet)} onPress={() => void toggleMute($)} />)
     }
   }
+  let trailing: JSX.Element | null = null // a word the app draws after the buttons
   if (isTerminal) {
     const live = isOn ? await indicator($, e) : null
     add(
@@ -925,12 +926,13 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
       ? `${s.glyph}${s.progress !== '' ? ` ${s.progress}` : ''} `
       : ''
     add(<Button key="settings" label={`${inGear}⚙`} plain {...(inGear !== '' ? lit : quiet)} onPress={() => void openSettings($)} />)
-    if (worded) items.push(await indicator($, e) ?? <Text key="indicator" />)
+    if (worded) trailing = await indicator($, e)
   }
   if (isOn) {
     if (inCall) add(<Button key="end" label={isTerminal ? 'End call' : 'End'} plain {...lit} onPress={() => void endCall($, '')} />)
     else if (isTerminal || !isReading) add(<Button key="call" label="● Call" plain {...lit} onPress={() => void startCall($)} />)
   }
+  if (trailing) items.push(trailing)
   return <Box flexShrink={0} alignItems="center">{items}</Box>
 }
 
