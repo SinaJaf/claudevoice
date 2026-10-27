@@ -294,10 +294,18 @@ function startTicker($: Engine): void {
   step()
 }
 
-/** Read aloud what you point at: the text you have selected (in a file you opened, or in
- *  the chat), else a file named in the prompt box (`@notes.md`, `@guide.pdf`, a path),
- *  from its start or the lines it names, else Claude's last reply. */
+/** Read aloud what you point at: text you have just copied (anywhere: a file open in the
+ *  app, a PDF in another app; a copied path reads that file), else the text you have
+ *  selected in the chat, else a file named in the prompt box (`@notes.md`, `@guide.pdf`,
+ *  a path), from its start or the lines it names, else Claude's last reply. */
 async function readAloud($: Engine): Promise<void> {
+  const copied = await freshCopy($)
+  if (copied !== '') {
+    const line = copied.trim()
+    const asFile = line.includes('\n') ? null : await findFile($, line.replace(/^(["'])(.*)\1$/, '$2'))
+    await readDocument($, asFile ?? { text: copied, title: 'copied text' })
+    return
+  }
   const selected = await $.ui.selection().catch(() => undefined)
   if (selected !== undefined && selected.text.trim() !== '') {
     await readDocument($, { text: selected.text, title: 'selection' })
@@ -321,6 +329,44 @@ async function readLastReply($: Engine): Promise<void> {
   if (!(await speak($, last.text))) return
   await setPhase($, 'speaking')
   watchPlayback($)
+}
+
+// ---- what you copied ------------------------------------------------------------------
+// The app tells a plugin what is selected in the chat, not in its Files pane or in other
+// apps. There, copy (⌘C / Ctrl+C) and press Read aloud: a copy made since the plugin last
+// looked is read. One that came out of this chat is left alone, so copying a command
+// from a reply doesn't stop Read aloud reading the reply.
+
+let lastCopied: string | null = null // the clipboard when last looked at; null: not yet
+
+/** The clipboard's text on macOS, Windows or Linux; '' when it can't be read. */
+async function clipboard($: Engine): Promise<string> {
+  const readers: string[][] = (await $.fs.exists('/usr/bin/pbpaste'))
+    ? [['/usr/bin/pbpaste']]
+    : (await $.env.get('OS')) === 'Windows_NT'
+      ? [['powershell', '-NoProfile', '-Command', 'Get-Clipboard -Raw']]
+      : [['wl-paste', '--no-newline'], ['xclip', '-selection', 'clipboard', '-o'], ['xsel', '--clipboard', '--output']]
+  for (const argv of readers) {
+    try {
+      const ran = await $.process.run(argv, { timeoutMs: 5000 })
+      if (ran.exitCode === 0) return ran.stdout
+    } catch {
+      // not installed here: try the next
+    }
+  }
+  return ''
+}
+
+/** Text copied since the plugin last looked, and not copied out of this chat; else ''. */
+async function freshCopy($: Engine): Promise<string> {
+  const text = await clipboard($)
+  const before = lastCopied
+  lastCopied = text
+  if (before === null || text === before || text.trim() === '') return ''
+  const squeeze = (t: string) => t.replace(/\s+/g, ' ').trim()
+  const copied = squeeze(text)
+  const messages = await $.session.messages()
+  return messages.some(m => squeeze(m.text).includes(copied)) ? '' : text
 }
 
 type FileToRead = { path: string; start?: number; end?: number }
@@ -377,7 +423,9 @@ async function readDocument($: Engine, what: FileToRead | { text: string; title:
   const where = 'start' in what && what.start !== undefined
     ? `${answer.pages ? 'page' : 'line'} ${what.start}${what.end !== undefined && what.end !== what.start ? `–${what.end}` : ''}`
     : 'the start'
-  $.ui.toast(answer.title === 'selection' ? 'Reading your selection' : `Reading ${answer.title ?? 'the file'} from ${where}`)
+  $.ui.toast('path' in what
+    ? `Reading ${answer.title ?? 'the file'} from ${where}`
+    : what.title === 'selection' ? 'Reading your selection' : 'Reading what you copied')
   await update($, reading, () => ({ title: answer.title ?? '', at: 0, of: 0, paused: false }))
   await setPhase($, 'speaking')
   watchPlayback($)
@@ -600,8 +648,9 @@ async function toggleMute($: Engine): Promise<void> {
 
 /** Stop Claude's voice, and forget any reading; in a call the mic opens right away. */
 async function stop($: Engine): Promise<void> {
-  await stopSpeaking($) // watchPlayback notices and, in a call, listens again
+  await stopSpeaking($) // in a call, watchPlayback notices and listens again
   await update($, reading, () => NOT_READING)
+  if (!(await read($, isCall))) await setPhase($, 'idle')
 }
 
 // ---- settings ----------------------------------------------------------------------
@@ -724,31 +773,29 @@ type Surface = Parameters<Engine['ui']['resolve']>[0]
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
 const WAVE = ['▁▃▅▃', '▃▅▇▅', '▅▇▅▃', '▇▅▃▁', '▅▃▁▃', '▃▁▃▅'] as const
+// The app's footer font draws block glyphs wide: one bar there, rising and falling.
+const BAR = ['▁', '▃', '▅', '▇', '▅', '▃'] as const
 
 /** How far a reading has got, as a percentage; empty before the server has said. */
 function progress(r: ReadingState): string {
   return r.of > 0 ? `${Math.floor((100 * r.at) / r.of)}%` : ''
 }
 
-/** A small live indicator: a glyph and one word, set beside the gear. */
-async function indicator($: Engine, e: Surface) {
-  const { Box, Text } = $.ui.resolve(e)
+type Status = { glyph: string; color: string; word: string; progress: string }
+
+/** What is happening now: a glyph, its color, one word, and how far a reading has got.
+ *  `narrow`: one character of wave instead of four. */
+async function status($: Engine, narrow = false): Promise<Status | null> {
   const current = await read($, phase)
   const t = await read($, tick)
   const isMuted = await read($, muted)
   const heardNow = await read($, hearing)
   const r = await read($, reading)
   if (current === 'idle') {
-    if (r.title === '' || !r.paused) return null
-    return (
-      <Box key="indicator">
-        <Text color="warning">‖</Text>
-        <Text dimColor> paused {progress(r)}</Text>
-      </Box>
-    )
+    return r.title !== '' && r.paused ? { glyph: '‖', color: 'warning', word: 'paused', progress: progress(r) } : null
   }
   const spin = SPINNER[t % SPINNER.length] ?? ''
-  const [glyph, color, word] = {
+  const looks: Record<Exclude<VoicePhase, 'idle'>, [string, string, string]> = {
     loading: [spin, 'claude', 'starting'],
     listening: isMuted
       ? ['◌', 'warning', 'muted']
@@ -757,12 +804,22 @@ async function indicator($: Engine, e: Surface) {
         : [t % 2 === 0 ? '●' : '○', 'error', 'listening'],
     transcribing: [spin, 'claude', 'writing'],
     thinking: [spin, 'claude', 'thinking'],
-    speaking: [WAVE[t % WAVE.length] ?? '', 'claude', r.title !== '' && !r.paused ? `reading ${progress(r)}`.trim() : 'speaking'],
-  }[current]
+    speaking: [(narrow ? BAR[t % BAR.length] : WAVE[t % WAVE.length]) ?? '', 'claude', 'speaking'],
+  }
+  const [glyph, color, word] = looks[current]
+  const isReading = current === 'speaking' && r.title !== '' && !r.paused
+  return { glyph, color, word: isReading ? 'reading' : word, progress: isReading ? progress(r) : '' }
+}
+
+/** A small live indicator: a glyph and one word, set beside the gear. */
+async function indicator($: Engine, e: Surface) {
+  const { Box, Text } = $.ui.resolve(e)
+  const s = await status($)
+  if (s === null) return null
   return (
     <Box key="indicator">
-      <Text color={color}>{glyph}</Text>
-      <Text dimColor> {word}</Text>
+      <Text color={s.color}>{s.glyph}</Text>
+      <Text dimColor> {`${s.word} ${s.progress}`.trim()}</Text>
     </Box>
   )
 }
@@ -809,7 +866,14 @@ async function controls($: Engine, e: Surface, compact: boolean) {
 }
 
 /** The controls drawn inside the prompt footer, under the mic, styled like the footer's
- *  own items. Only what can be used right now is shown; a small indicator sits by the gear. */
+ *  own items. Only what can be used right now is shown; a small indicator sits by the gear.
+ *
+ *  The app gives the footer about 220 pixels and cuts whatever passes them to "…",
+ *  buttons included, and draws plain text after the buttons. So on the app every state
+ *  is kept to about 200 pixels: the live glyph rides in the gear button's label (one
+ *  bar of wave, not four), a word only where few buttons leave room (starting, writing,
+ *  thinking), "End" for "End call", no Call button while a file is read, nothing
+ *  that changes width on hover, and no glyph while muted (Unmute says it). */
 async function footer($: Engine, e: Surface, modes: readonly string[]) {
   const { Box, Button, Text } = $.ui.resolve(e)
   const isOn = await isEnabled($)
@@ -819,40 +883,55 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   const micOpen = inCall && (await read($, take)) !== ''
   const r = await read($, reading)
   const isReading = !inCall && r.title !== ''
+  // The terminal separates footer items with dots; the app spaces its buttons itself.
+  const isTerminal = e.surface === 'terminal'
   const quiet = { dimColor: true, hover: { dimColor: false, scope: 'voice' } } as const
-  const lit = { hover: { bold: true, scope: 'voice' } } as const
+  // Bold on hover widens a button, which on the app can push the row past its width.
+  const lit = { hover: isTerminal ? { bold: true, scope: 'voice' } : { underline: true, scope: 'voice' } } as const
+  const playing = current === 'speaking' || (isReading && r.paused)
   const items: JSX.Element[] = []
   const add = (el: JSX.Element) => {
-    if (items.length > 0) items.push(<Text key={`sep-${items.length}`} dimColor> · </Text>)
+    if (isTerminal && items.length > 0) items.push(<Text key={`sep-${items.length}`} dimColor> · </Text>)
     items.push(el)
   }
 
   if (modes.length > 0) add(<Text key="modes" dimColor>{modes.join(' & ')}</Text>)
   if (isOn) {
-    if (!inCall) add(<Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />)
+    // While something plays, Pause/Resume and Stop take Read aloud's place.
+    if (!inCall && !playing) add(<Button key="read" label="Read aloud" plain {...quiet} onPress={() => void readAloud($)} />)
     if (inCall && current === 'listening') add(<Button key="done" label="Done" plain {...lit} onPress={() => void done($)} />)
     if (isReading && current === 'speaking' && !r.paused) add(<Button key="pause" label="Pause" plain {...lit} onPress={() => void pauseReading($)} />)
     if (isReading && r.paused && current !== 'speaking') add(<Button key="resume" label="Resume" plain {...lit} onPress={() => void resumeReading($)} />)
-    if (current === 'speaking' || (isReading && r.paused)) add(<Button key="stop" label="Stop" plain {...lit} onPress={() => void stop($)} />)
+    if (playing) add(<Button key="stop" label="Stop" plain {...lit} onPress={() => void stop($)} />)
     // Mute while the mic can hear you: your turn, or Claude speaking with talk-over on.
     if (inCall && (current === 'listening' || (micOpen && current === 'speaking'))) {
       add(<Button key="mute" label={isMuted ? 'Unmute' : 'Mute'} plain {...(isMuted ? lit : quiet)} onPress={() => void toggleMute($)} />)
     }
   }
-  const live = isOn ? await indicator($, e) : null
-  add(
-    <Box key="gear-box">
-      {live}
-      {live && <Text> </Text>}
-      <Button key="settings" label="⚙" plain {...quiet} onPress={() => void openSettings($)} />
-    </Box>,
-  )
-  if (isOn) {
-    add(inCall
-      ? <Button key="end" label="End call" plain {...lit} onPress={() => void endCall($, '')} />
-      : <Button key="call" label="● Call" plain {...lit} onPress={() => void startCall($)} />)
+  if (isTerminal) {
+    const live = isOn ? await indicator($, e) : null
+    add(
+      <Box key="gear-box">
+        {live}
+        {live && <Text> </Text>}
+        <Button key="settings" label="⚙" plain {...quiet} onPress={() => void openSettings($)} />
+      </Box>,
+    )
+  } else {
+    const s = isOn ? await status($, true) : null
+    const worded = s !== null && (current === 'loading' || current === 'transcribing' || current === 'thinking')
+    // A button's label is plain text: the glyph (and a reading's progress) go in it, lit.
+    const inGear = s !== null && !worded && !(inCall && isMuted)
+      ? `${s.glyph}${s.progress !== '' ? ` ${s.progress}` : ''} `
+      : ''
+    add(<Button key="settings" label={`${inGear}⚙`} plain {...(inGear !== '' ? lit : quiet)} onPress={() => void openSettings($)} />)
+    if (worded) items.push(await indicator($, e) ?? <Text key="indicator" />)
   }
-  return <Box>{items}</Box>
+  if (isOn) {
+    if (inCall) add(<Button key="end" label={isTerminal ? 'End call' : 'End'} plain {...lit} onPress={() => void endCall($, '')} />)
+    else if (isTerminal || !isReading) add(<Button key="call" label="● Call" plain {...lit} onPress={() => void startCall($)} />)
+  }
+  return <Box flexShrink={0} alignItems="center">{items}</Box>
 }
 
 async function settingsPane($: Engine, e: Surface) {
@@ -1013,6 +1092,10 @@ export const register: Register = on => {
     await update($, talkOver, () => savedTalkOver !== false)
     const savedChat = await $.store.get(await chatStoreKey($))
     await update($, chat, () => (savedChat !== null && typeof savedChat === 'object' ? (savedChat as ChatSettings) : {}))
+    // Only what is copied from now on counts as "just copied".
+    void clipboard($).then(text => {
+      if (lastCopied === null) lastCopied = text
+    })
     return next(e)
   })
 

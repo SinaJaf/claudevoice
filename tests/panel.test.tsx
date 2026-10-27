@@ -10,6 +10,12 @@ const BAND = {
 
 type Fetch = { url: string; body: string }
 
+/** The gear's label on the app: the live glyph, and a reading's progress, before the ⚙. */
+async function gear(ui: { find: (q: { key: string }) => Promise<{ text?: string } | undefined> }): Promise<string> {
+  return (await ui.find({ key: 'settings' }))?.text ?? ''
+}
+const WAVE = /[▁▃▅▇]/
+
 type Reading = { title: string; at: number; of: number; paused: boolean } | null
 
 /** The world beneath the mod: a running Kokoro server, a session with one reply. */
@@ -68,7 +74,10 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }) {
   // The listener answers through its --result file: at once ('now', as when Smart Turn
   // hears you finish), or only after Done ('on-done').
   const listener = { answer: 'now' as 'now' | 'on-done', done: false }
+  // The clipboard, as wl-paste reads it (this test machine is neither a Mac nor Windows).
+  const clip = { text: 'something copied long ago' }
   on('process.run', (_, e) => {
+    if (e.argv[0] === 'wl-paste') return { value: { exitCode: 0, stdout: clip.text, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     runs.push([...e.argv])
     const at = e.argv.indexOf('--result')
     if (at >= 0) {
@@ -119,7 +128,7 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }) {
     writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, writes, opened, box, listener, selection }
+  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -135,11 +144,13 @@ test('Read aloud speaks the last reply through the Kokoro server', async ($, on)
     expect(await ui.find({ type: 'Button', text: /Call/ })).toBeDefined()
     await ui.press({ key: 'read' })
     expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('Hello **there**, friend.')
-    expect((await ui.find({ type: 'Text', text: /speaking/ }))?.text).toContain('speaking')
+    if (surface === 'terminal') expect((await ui.find({ type: 'Text', text: /speaking/ }))?.text).toContain('speaking')
+    else expect(await gear(ui)).toMatch(WAVE)
     await ui.press({ key: 'stop' })
     expect(w.fetches.some(f => f.url.endsWith('/stop'))).toBe(true)
     await clock.advance(400)
     expect(await ui.find({ type: 'Text', text: /speaking/ })).toBeUndefined()
+    if (surface === 'desktop') expect(await gear(ui)).toBe('⚙')
     await ui.unmount()
     w.fetches.length = 0
   }
@@ -176,7 +187,7 @@ test('A live call: the mic opens while Claude talks, the turn ends when you fini
   state.speaking = false
   await clock.advance(400)
   expect(w.runs.filter(isListen).length).toBe(1)
-  expect(await ui.find({ type: 'Text', text: /listening/ })).toBeDefined()
+  expect(await gear(ui)).toMatch(/[●○] ⚙/)
   expect(await ui.find({ key: 'done' })).toBeDefined()
   expect(w.submitted).toEqual([])
 
@@ -328,16 +339,18 @@ test('Stop cuts the voice and hands you the turn; Mute pauses the mic without lo
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   await ui.press({ key: 'call' })
-  expect(await ui.find({ type: 'Text', text: /speaking/ })).toBeDefined()
+  expect(await gear(ui)).toMatch(WAVE)
   await ui.press({ key: 'stop' })
   expect(w.fetches.some(f => f.url.endsWith('/stop'))).toBe(true)
   await clock.advance(400)
-  expect(await ui.find({ type: 'Text', text: /listening/ })).toBeDefined()
+  expect(await gear(ui)).toMatch(/[●○] ⚙/)
 
   await ui.press({ key: 'mute' })
   expect(w.writes.filter(x => x.path.endsWith('listen.mute')).pop()?.content).toBe('1')
   expect(w.written.some(p => p.endsWith('listen.stop'))).toBe(false)
-  expect(await ui.find({ type: 'Text', text: /muted/ })).toBeDefined()
+  // Muted: Unmute says so, and the gear carries no glyph (room for End on the app).
+  expect(await ui.find({ type: 'Button', text: /Unmute/ })).toBeDefined()
+  expect(await gear(ui)).toBe('⚙')
   await ui.press({ key: 'mute' })
   expect(w.writes.filter(x => x.path.endsWith('listen.mute')).pop()?.content).toBe('0')
   await ui.unmount()
@@ -450,14 +463,16 @@ test('A reading can be paused and resumed where it stopped; Stop forgets it', as
   w.box.text = '@notes.md'
   await ui.press({ key: 'read' })
   await clock.advance(400)
-  expect(await ui.find({ type: 'Text', text: /reading 0%/ })).toBeDefined()
+  expect(await gear(ui)).toMatch(/^[▁▃▅▇] 0% ⚙$/)
   expect(await ui.find({ key: 'pause' })).toBeDefined()
   expect(await ui.find({ key: 'resume' })).toBeUndefined()
+  // On the app, Call makes room while a file is read.
+  expect(await ui.find({ key: 'call' })).toBeUndefined()
 
   // Pause: the voice stops, the place is kept, Resume and Stop are offered.
   await ui.press({ key: 'pause' })
   await clock.advance(400)
-  expect(await ui.find({ type: 'Text', text: /paused 25%/ })).toBeDefined()
+  expect(await gear(ui)).toBe('‖ 25% ⚙')
   expect(await ui.find({ key: 'pause' })).toBeUndefined()
   expect(await ui.find({ key: 'resume' })).toBeDefined()
   expect(await ui.find({ key: 'stop' })).toBeDefined()
@@ -466,13 +481,14 @@ test('A reading can be paused and resumed where it stopped; Stop forgets it', as
   await ui.press({ key: 'resume' })
   expect(readBody(w)).toEqual({ resume: true })
   await clock.advance(400)
-  expect(await ui.find({ type: 'Text', text: /reading 25%/ })).toBeDefined()
+  expect(await gear(ui)).toMatch(/^[▁▃▅▇] 25% ⚙$/)
 
-  // Stop: the reading is gone; Read aloud is there for the next one.
+  // Stop: the reading is gone; Read aloud and Call are back.
   await ui.press({ key: 'stop' })
   await clock.advance(400)
+  expect(await ui.find({ key: 'call' })).toBeDefined()
   expect(await ui.find({ key: 'resume' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /paused|reading/ })).toBeUndefined()
+  expect(await gear(ui)).toBe('⚙')
   expect(await ui.find({ key: 'read' })).toBeDefined()
   await ui.unmount()
 })
@@ -491,4 +507,91 @@ test('/read names a file, and a number starts from that line or page', async ($,
   expect(readBody(w)).toEqual({ path: '/proj/notes.md' })
   const missing = await $.command.run({ ...TYPED, command: 'read', args: 'nowhere.md' })
   expect(missing.text).toContain('No file called nowhere.md')
+})
+
+test('Text copied in the Files pane or another app is read; a copy out of the chat is not', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const spoke = () => w.fetches.find(f => f.url.endsWith('/speak'))?.body ?? ''
+  const askedToRead = () => w.fetches.some(f => f.url.endsWith('/read'))
+
+  // On the clipboard before the session began: not "just copied", so the reply is read.
+  await ui.press({ key: 'read' })
+  expect(askedToRead()).toBe(false)
+  expect(spoke()).toContain('Hello **there**, friend.')
+  await ui.press({ key: 'stop' })
+
+  // Copied from a file open in the app: that is read.
+  w.clip.text = 'A paragraph copied from the Files pane.'
+  await ui.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ text: 'A paragraph copied from the Files pane.', title: 'copied text' })
+  await ui.press({ key: 'stop' })
+
+  // Pressed again with nothing new copied: the last reply.
+  w.fetches.length = 0
+  await ui.press({ key: 'read' })
+  expect(askedToRead()).toBe(false)
+  expect(spoke()).toContain('Hello')
+  await ui.press({ key: 'stop' })
+
+  // A copied path: that file, from its start.
+  w.clip.text = '/proj/notes.md\n'
+  await ui.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ path: '/proj/notes.md' })
+  await ui.press({ key: 'stop' })
+
+  // Copied out of this chat (a command from a reply, say): the reply is read instead.
+  w.clip.text = 'Hello **there**,\n  friend.'
+  w.fetches.length = 0
+  await ui.press({ key: 'read' })
+  expect(askedToRead()).toBe(false)
+  expect(spoke()).toContain('Hello')
+  await ui.unmount()
+})
+
+test('The footer: dots only on the terminal; while something plays, Read aloud makes room', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  world(on, state)
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await term.find({ type: 'Text', text: /·/ })).toBeDefined()
+  await term.unmount()
+
+  const desk = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await desk.find({ type: 'Text', text: /·/ })).toBeUndefined()
+  await desk.press({ key: 'read' })
+  // Nothing but buttons (and the footer's own mode label) while something plays: no text
+  // of ours for the app to cut to "…".
+  expect(await desk.find({ type: 'Text', text: /^(?!Auto$)/ })).toBeUndefined()
+  expect(await desk.find({ key: 'read' })).toBeUndefined()
+  expect(await desk.find({ key: 'stop' })).toBeDefined()
+  await desk.press({ key: 'stop' })
+  expect(await desk.find({ key: 'read' })).toBeDefined()
+  await desk.unmount()
+})
+
+test('In a call the app footer stays narrow: End for End call, and nothing widens on hover', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  world(on, state)
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const desk = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await desk.press({ key: 'call' })
+  expect((await desk.find({ key: 'end' }))?.text).toBe('End')
+  // The greeting plays with the mic open: Stop, Mute, the gear with one bar of wave, End.
+  expect(await gear(desk)).toMatch(/^[▁▃▅▇] ⚙$/)
+  await desk.press({ key: 'end' })
+  await desk.unmount()
+  const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await term.press({ key: 'call' })
+  expect((await term.find({ key: 'end' }))?.text).toBe('End call')
+  await term.press({ key: 'end' })
+  await term.unmount()
 })

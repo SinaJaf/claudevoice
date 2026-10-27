@@ -10,7 +10,7 @@ any time. It all runs on your computer.
 
 - **Just talk.** Pause to think as long as you like; Claude answers when you sound finished.
 - **Cut in.** Start talking while Claude speaks, and it stops to listen.
-- **Read files aloud.** Select part of a markdown, text or PDF file, or name the file, and press
+- **Read files aloud.** Copy part of a markdown, text or PDF file, or name the file, and press
   **Read aloud**. Pause and pick up where you left off.
 - **Private and free.** Listening and speaking run on your computer, with no extra account or API key.
 
@@ -54,12 +54,17 @@ finished sentence ends it after a short pause. A long pause ends it anyway, and 
 
 **Read aloud** reads what you point it at, in this order:
 
-1. **Text you've selected.** Highlight a section of a file you have open, or of the chat, and press
-   **Read aloud**.
-2. **A file named in the prompt box.** With nothing selected, type `@` and pick the file
-   (`@notes.md`, `@report.pdf`), then press **Read aloud** to hear it from the start.
-   `@notes.md#L40-80` reads just those lines. A path dragged into the box works too.
-3. **Otherwise**, Claude's last reply.
+1. **Text you've just copied.** In a file open in the app's Files pane, or a PDF in any other app,
+   highlight a section, copy it (⌘C, or Ctrl+C), and press **Read aloud**. A copied file path
+   reads that file. Something copied out of the chat itself is left alone.
+2. **Text you've selected in the chat.** Highlight it and press **Read aloud**; no copying needed.
+3. **A file named in the prompt box.** Type `@` and pick the file (`@notes.md`, `@report.pdf`),
+   then press **Read aloud** to hear it from the start. `@notes.md#L40-80` reads just those lines.
+   A path dragged into the box works too.
+4. **Otherwise**, Claude's last reply.
+
+Why copy in the Files pane: the app tells plugins what you've highlighted in the chat, but not in
+the Files pane, and not which file is open there.
 
 While a file is being read, **Pause** keeps your place, **Resume** carries on from the sentence you
 paused in, and **Stop** ends it. The indicator by the gear shows how far it has got.
