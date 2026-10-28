@@ -32,6 +32,7 @@ import urllib.error
 import urllib.request
 import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import numpy as np
 
@@ -43,6 +44,10 @@ SAMPLE_RATE = 24_000
 BLOCK = 1024  # frames per write; small so /stop takes effect within ~40 ms
 
 log = logging.getLogger("claudevoice.server")
+
+# The plugin folder this server runs from: the plugin replaces a server an older version
+# of itself started (each version is installed in a folder of its own).
+ROOT = str(Path(__file__).resolve().parent.parent)
 
 CLOUD_PIECE = 1200  # characters per request when a cloud voice reads a document
 
@@ -455,7 +460,8 @@ def make_handler(speaker: Speaker, cfg: dict):
                 self._json(200, {"ok": True, "speaking": speaker.speaking, "voice": live["voice"],
                                  "engine": live.get("tts_engine", "kokoro"), "last_error": speaker.last_error,
                                  "output_device": speaker.output_device,
-                                 "reading": speaker.reading.state() if speaker.reading else None})
+                                 "reading": speaker.reading.state() if speaker.reading else None,
+                                 "root": ROOT})
             else:
                 self._json(404, {"error": "not found"})
 

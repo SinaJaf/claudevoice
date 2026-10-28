@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ChatSettings, ListenMode, Patience, ReadingState, VoicePhase, VoiceSettings } from '../types'
+import type { ChatSettings, ListenMode, Patience, ReadingState, Versions, VoicePhase, VoiceSettings } from '../types'
 
 const SERVER = 'http://127.0.0.1:8765'
 
@@ -35,6 +35,7 @@ const patience = atom({ plugin: 'claudevoice', key: 'patience' } as const, 'norm
 // A file or selection being read aloud, as the voice server reports it.
 const NOT_READING: ReadingState = { title: '', at: 0, of: 0, paused: false }
 const reading = atom({ plugin: 'claudevoice', key: 'reading' } as const, NOT_READING)
+const versions = atom({ plugin: 'claudevoice', key: 'versions' } as const, { own: '', latest: '', updating: false } as Versions)
 const MODE_STORE_KEY = 'callMode'
 const TALK_OVER_STORE_KEY = 'talkOver'
 const PATIENCE_STORE_KEY = 'patience'
@@ -77,6 +78,39 @@ async function uv($: Engine): Promise<string> {
   return 'uv'
 }
 
+/** uv, installed the first time it is missing with Astral's own installer (the line the
+ *  README gives), so setting up needs no terminal. '' when it could not be installed. */
+async function ensureUv($: Engine): Promise<string> {
+  const found = await uv($)
+  if (found !== 'uv') return found
+  const onPath = await $.process.run(['uv', '--version'], { timeoutMs: 20000 }).catch(() => null)
+  if (onPath?.exitCode === 0) return 'uv'
+  await setupNote($, 'Installing uv, the tool the voice runs on (once)…')
+  const argv = (await $.env.get('OS')) === 'Windows_NT'
+    ? ['powershell', '-NoProfile', '-ExecutionPolicy', 'ByPass', '-Command', 'irm https://astral.sh/uv/install.ps1 | iex']
+    : ['sh', '-c', 'curl -LsSf https://astral.sh/uv/install.sh | sh || wget -qO- https://astral.sh/uv/install.sh | sh']
+  const ran = await $.process.run(argv, { timeoutMs: 300000 }).catch(() => null)
+  await setupNote($, '')
+  const installed = await uv($)
+  if (installed !== 'uv') return installed
+  const why = ran?.stderr.trim().split('\n').pop() ?? 'the installer did not run'
+  $.ui.toast(`Could not install uv (${why}). Install it as the README says, then try again: https://docs.astral.sh/uv/`)
+  return ''
+}
+
+/** Say what a slow setup step is doing: as a toast, in the pane, and as "starting" in the
+ *  footer while nothing else is going on. '' when it is done. */
+async function setupNote($: Engine, text: string): Promise<void> {
+  await update($, note, () => text)
+  const current = await read($, phase)
+  if (text !== '') {
+    $.ui.toast(text)
+    if (current === 'idle') await setPhase($, 'loading')
+  } else if (current === 'loading' && !(await read($, isCall))) {
+    await setPhase($, 'idle')
+  }
+}
+
 let pythonArgv: string[] | null = null
 
 /** The interpreter for the Python side: the project's venv once it exists, else `uv run`. */
@@ -106,12 +140,14 @@ async function ensurePython($: Engine): Promise<boolean> {
     }
     return true
   }
-  await update($, note, () => 'installing the voice engine (first time only, a few minutes)…')
-  const ran = await $.process.run([await uv($), 'sync', '--project', r], { cwd: r, timeoutMs: 600000 })
-  await update($, note, () => '')
+  const uvPath = await ensureUv($)
+  if (uvPath === '') return false
+  await setupNote($, 'Setting up the voice, first time only: a few minutes (about 1 GB to download)…')
+  const ran = await $.process.run([uvPath, 'sync', '--project', r], { cwd: r, timeoutMs: 600000 })
+  await setupNote($, '')
   if (ran.exitCode !== 0) {
     const why = ran.stderr.trim().split('\n').pop() ?? ''
-    $.ui.toast(`voice setup failed (is uv installed? https://docs.astral.sh/uv/): ${why}`)
+    $.ui.toast(`Voice setup failed: ${why}`)
     return false
   }
   pythonArgv = null
@@ -120,7 +156,7 @@ async function ensurePython($: Engine): Promise<boolean> {
 
 // ---- talking to the Kokoro server --------------------------------------------
 
-type Health = { speaking: boolean; last_error?: string; reading?: ReadingState | null }
+type Health = { speaking: boolean; last_error?: string; reading?: ReadingState | null; root?: string }
 
 async function health($: Engine): Promise<Health | null> {
   try {
@@ -131,12 +167,26 @@ async function health($: Engine): Promise<Health | null> {
   }
 }
 
+/** A folder as one spelling: forward slashes, no trailing one, a Windows drive any case. */
+function samePath(a: string): string {
+  const p = a.replace(/\\/g, '/').replace(/\/+$/, '')
+  return /^[A-Za-z]:\//.test(p) ? p.toLowerCase() : p
+}
+
+let replacedServer = false
+
 async function ensureServer($: Engine): Promise<boolean> {
-  if (await health($)) return true
+  const running = await health($)
+  // A server an earlier version started (from its own folder) is replaced, once a load.
+  if (running && !replacedServer && samePath(running.root ?? '') !== samePath(root($))) {
+    replacedServer = true
+    return restartServer($)
+  }
+  if (running) return true
   if (!(await ensurePython($))) return false
-  await update($, note, () => 'starting the voice server (downloads the voice model the first time)…')
+  await setupNote($, 'Starting the voice (the first time, it downloads the voice model)…')
   const ran = await $.process.run([...(await python($)), '-m', 'claudevoice', 'start'], { cwd: root($), timeoutMs: 360000 })
-  await update($, note, () => '')
+  await setupNote($, '')
   if (ran.exitCode !== 0 || !(await health($))) {
     $.ui.toast('voice server failed to start; see ~/.claudevoice/server.log')
     return false
@@ -149,6 +199,96 @@ async function restartServer($: Engine): Promise<boolean> {
   await $.process.run([...(await python($)), '-m', 'claudevoice', 'stop-server'], { cwd: root($), timeoutMs: 30000 })
   for (let i = 0; i < 20 && (await health($)); i++) await new Promise<void>(done => $.clock.after(250, done))
   return ensureServer($)
+}
+
+// ---- updates ---------------------------------------------------------------------------
+// A plugin installed from GitHub updates only when its marketplace is refreshed, which
+// Claude Code leaves to the person (auto-update is off for marketplaces like this one).
+// So the plugin looks for a newer version now and then, says so once, and Update now in
+// the settings runs the two documented commands: refresh the marketplace, update the plugin.
+
+const LATEST_URL = 'https://raw.githubusercontent.com/SinaJaf/claudevoice/main/.claude-plugin/plugin.json'
+const UPDATE_CHECKED_KEY = 'updateChecked'
+const UPDATE_EVERY_MS = 6 * 60 * 60 * 1000
+
+/** 1 when version a is newer than b, -1 when older, 0 when the same (dotted numbers). */
+function compareVersions(a: string, b: string): number {
+  const x = a.split('.').map(n => Number.parseInt(n, 10) || 0)
+  const y = b.split('.').map(n => Number.parseInt(n, 10) || 0)
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] ?? 0) - (y[i] ?? 0)
+    if (d !== 0) return d > 0 ? 1 : -1
+  }
+  return 0
+}
+
+async function ownVersion($: Engine): Promise<string> {
+  try {
+    return String((JSON.parse(String(await $.fs.read(`${root($)}/.claude-plugin/plugin.json`))) as { version?: string }).version ?? '')
+  } catch {
+    return ''
+  }
+}
+
+/** Look for a newer version on GitHub, at most every few hours; say so once when there is. */
+async function checkForUpdate($: Engine): Promise<void> {
+  const own = await ownVersion($)
+  await update($, versions, v => ({ ...v, own }))
+  const now = await $.clock.now()
+  const last = await $.store.get(UPDATE_CHECKED_KEY) // absent: never looked
+  if (own === '' || (typeof last === 'number' && now - last < UPDATE_EVERY_MS)) return
+  await $.store.set(UPDATE_CHECKED_KEY, now)
+  let latest = ''
+  try {
+    const r = await $.http.fetch(LATEST_URL)
+    if (r.ok) latest = String((JSON.parse(r.text) as { version?: string }).version ?? '')
+  } catch {
+    return // offline: look again next time
+  }
+  if (latest === '' || compareVersions(latest, own) <= 0) return
+  await update($, versions, v => ({ ...v, latest }))
+  $.ui.toast(`claudevoice ${latest} is out (you have ${own}). Update it from the ⚙ settings.`)
+}
+
+/** The claude command: the one the desktop app runs this session with, else the one on PATH. */
+async function claudeCommand($: Engine): Promise<string[]> {
+  const found: string[] = []
+  const exec = (await $.env.get('CLAUDE_CODE_EXECPATH')) ?? ''
+  if (exec !== '') {
+    const base = exec.replace(/[\\/]+$/, '')
+    found.push(base, `${base}/MacOS/claude`, `${base}/claude.exe`, `${base}/claude`)
+  }
+  const h = await home($)
+  found.push(`${h}/.local/bin/claude`, `${h}/.local/bin/claude.exe`)
+  for (const path of found) {
+    try {
+      if ((await $.fs.stat(path)).kind === 'file') return [path]
+    } catch {
+      // not here
+    }
+  }
+  return ['claude']
+}
+
+/** Update now: refresh the marketplace, update the plugin; the new version loads after
+ *  /reload-plugins (or in the next session). */
+async function updatePlugin($: Engine): Promise<void> {
+  await update($, versions, v => ({ ...v, updating: true }))
+  const claude = await claudeCommand($)
+  const steps = [['plugin', 'marketplace', 'update', 'claudevoice'], ['plugin', 'update', 'claudevoice@claudevoice']]
+  let failed = ''
+  for (const step of steps) {
+    const ran = await $.process.run([...claude, ...step], { timeoutMs: 300000 }).catch(() => null)
+    if (ran === null || ran.exitCode !== 0) {
+      failed = `${(ran?.stderr || ran?.stdout || 'the claude command was not found').trim().split('\n').pop() ?? ''}`
+      break
+    }
+  }
+  const latest = (await read($, versions)).latest
+  await update($, versions, v => ({ ...v, updating: false, latest: failed === '' ? '' : v.latest }))
+  $.ui.toast(failed === ''
+    ? `claudevoice ${latest} is installed. Type /reload-plugins to switch to it.`
+    : `Could not update (${failed}). In a terminal: claude plugin marketplace update claudevoice, then claude plugin update claudevoice@claudevoice`)
 }
 
 // ---- this chat's settings over the all-chats ones ------------------------------------
@@ -1085,6 +1225,7 @@ async function settingsPane($: Engine, e: Surface) {
     { value: 'on', label: 'On: talking while Claude speaks stops its voice' },
     { value: 'off', label: 'Off (better without headphones)' },
   ]
+  const { own: ownShown, latest: latestShown, updating: isUpdating } = await read($, versions)
   const mode = await read($, listenMode)
   const pause = await read($, patience)
   const over = await read($, talkOver)
@@ -1131,6 +1272,12 @@ async function settingsPane($: Engine, e: Surface) {
 
   return (
     <Box flexDirection="column">
+      {latestShown !== '' && (
+        <Box key="update" marginBottom={1}>
+          <Text>claudevoice {latestShown} is out (you have {ownShown}). </Text>
+          <Button key="update-now" label={isUpdating ? 'Updating…' : 'Update now'} variant="primary" onPress={() => void (isUpdating ? undefined : updatePlugin($))} />
+        </Box>
+      )}
       <Text dimColor>Each choice applies to all chats. Open "this chat" under a setting to change it for this chat only.</Text>
       <Box marginTop={1} flexDirection="column">
         {row('plugin', 'Voice plugin', plugin, isOn ? 'on' : 'off', (v: string) => void setEnabled($, v === 'on'), true)}
@@ -1191,6 +1338,7 @@ export const register: Register = on => {
     await update($, talkOver, () => savedTalkOver !== false)
     const savedChat = await $.store.get(await chatStoreKey($))
     await update($, chat, () => (savedChat !== null && typeof savedChat === 'object' ? (savedChat as ChatSettings) : {}))
+    void checkForUpdate($)
     // Only what is copied from now on counts as "just copied".
     void look($, false).then(seen => {
       if (lastStamp === null) lastStamp = seen.stamp

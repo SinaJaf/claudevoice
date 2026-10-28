@@ -23,6 +23,10 @@ export type ChatSettings = {
  *  from) of how many, and whether it is paused. An empty title: nothing is being read. */
 export type ReadingState = { title: string; at: number; of: number; paused: boolean }
 
+/** This plugin's version, and a newer one published on GitHub ('' when there is none);
+ *  `updating` while Update now runs. */
+export type Versions = { own: string; latest: string; updating: boolean }
+
 declare module 'claude-code' {
   interface PluginState {
     'claudevoice': {
@@ -42,6 +46,7 @@ declare module 'claude-code' {
       talkOver: boolean
       patience: Patience
       reading: ReadingState
+      versions: Versions
     }
   }
 }

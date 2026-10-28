@@ -16,12 +16,15 @@ any time. It reads your files aloud too. It all runs on your computer.
 
 ## Get started
 
-1. **Install [uv](https://docs.astral.sh/uv/)**, once per computer:
-   `curl -LsSf https://astral.sh/uv/install.sh | sh` ([Windows and Linux notes](#install-in-detail)).
-2. **Add the plugin.** In the Claude Code desktop app: **+** next to the prompt, **Plugins**,
+1. **Add the plugin.** In the Claude Code desktop app: **+** next to the prompt, **Plugins**,
    **Add marketplace** `SinaJaf/claudevoice`, then **Add plugin**.
-3. **Press ● Call** under the prompt box and start talking. The first call sets itself up, which
-   takes a few minutes once.
+2. **Press ● Call** under the prompt box and start talking. The first time, it sets itself up
+   (it installs [uv](https://docs.astral.sh/uv/) if needed and downloads the voice): a few minutes,
+   once, with pop-ups saying what it is doing. On Linux, install PortAudio first
+   ([details](#install-in-detail)).
+
+When a new version comes out, a pop-up says so, and **Update now** in the ⚙ settings installs it
+([Updating](#updating)).
 
 ## How it works
 
@@ -135,7 +138,9 @@ The gear covers the common ones. Everything is in `~/.claudevoice/config.json`, 
 
 ## Install in detail
 
-**1. Install uv** (once per computer; it brings its own Python, nothing else to set up). macOS and Linux:
+**1. uv** runs the plugin's Python side (it brings its own Python, nothing else to set up). The
+plugin installs it the first time if it is missing, with Astral's own installer. To install it
+yourself, on macOS and Linux:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -165,10 +170,27 @@ Open sessions pick it up with `/reload-plugins`; new sessions load it on their o
 
 **3. Press ● Call.** The first time, it sets itself up: the Python packages (~900 MB) and the models
 (Kokoro ~330 MB, Parakeet ~650 MB, Smart Turn and Silero VAD a few MB). That takes a few minutes
-once; the footer says what it is doing. Your system asks for microphone access the first time.
-Everything lives under the plugin folder, `~/.claudevoice/` and the Hugging Face cache.
+once; pop-ups and the footer say what it is doing. Your system asks for microphone access the
+first time. Everything lives under the plugin folder, `~/.claudevoice/` and the Hugging Face cache.
 
 Nothing else is needed: no espeak-ng (it ships inside the packages), no Xcode tools, no GPU drivers.
+
+## Updating
+
+Claude Code doesn't update plugins from GitHub on its own (auto-update is off for marketplaces
+like this one). So the plugin checks for a newer version every few hours. When there is one, a
+pop-up says so, and the ⚙ settings show **Update now**: press it, then type `/reload-plugins`.
+The first use after an update replaces the voice server with the new version's.
+
+By hand, in a terminal:
+
+```
+claude plugin marketplace update claudevoice
+claude plugin update claudevoice@claudevoice
+```
+
+then `/reload-plugins` in the app. To let Claude Code update it by itself: in a terminal session,
+`/plugin`, **Marketplaces**, **claudevoice**, **Enable auto-update**.
 
 ## Where it runs
 
@@ -259,8 +281,7 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 - "speech recognition is not allowed": turn on **Claude Voice transcription** in System Settings,
   Privacy & Security, Speech Recognition.
 - Windows: a black `python.exe` window stays open, and closing it stops the voice (0.4.2 and
-  earlier). Update the plugin, then close that window once: the voice server starts again,
-  hidden, the next time you press **Read aloud** or **● Call**.
+  earlier). [Update](#updating) the plugin: the new version replaces that server by itself.
 - Windows: "turn on Online speech recognition": Windows Settings, Privacy & security, Speech. The
   windows engine uses the default microphone (Settings, System, Sound, Input); pick Whisper in the
   gear to choose a specific one.

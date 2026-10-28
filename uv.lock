@@ -327,7 +327,7 @@ wheels = [
 
 [[package]]
 name = "claudevoice"
-version = "0.4.3"
+version = "0.4.4"
 source = { editable = "." }
 dependencies = [
     { name = "en-core-web-sm" },

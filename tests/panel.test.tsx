@@ -19,7 +19,12 @@ const WAVE = /[▁▃▅▇]/
 type Reading = { title: string; at: number; of: number; paused: boolean } | null
 
 /** The world beneath the mod: a running Kokoro server, a session with one reply. */
-function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { mac?: boolean } = {}) {
+function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { mac?: boolean; fresh?: boolean; latest?: string } = {}) {
+  // A fresh machine: no uv and no venv until the plugin installs them.
+  const machine = { uv: opts.fresh !== true, venv: opts.fresh !== true }
+  // The voice server: started by the plugin from its folder, which /health then reports. One
+  // already running at first says no folder, as one an earlier version started would.
+  const server = { root: '', down: false }
   const fetches: Fetch[] = []
   const runs: string[][] = []
   const submitted: string[] = []
@@ -41,6 +46,10 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   on('http.fetch', (_, e) => {
     const body = e.init?.body ?? ''
     fetches.push({ url: e.url, body })
+    if (e.url.startsWith('https://raw.githubusercontent.com/SinaJaf/claudevoice/')) {
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ version: opts.latest ?? '0.4.4' }) } }
+    }
+    if (server.down) return { value: { status: 503, ok: false, headers: {}, text: '{}' } }
     let answer: Record<string, unknown> = { ok: true }
     if (e.url.endsWith('/speak')) {
       state.speaking = true
@@ -67,7 +76,7 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
       state.speaking = false
       if (state.reading) state.reading = { ...state.reading, at: 10, paused: true }
     }
-    if (e.url.endsWith('/health')) answer = { ok: true, speaking: state.speaking, reading: state.reading ?? null }
+    if (e.url.endsWith('/health')) answer = { ok: true, speaking: state.speaking, reading: state.reading ?? null, ...(server.root ? { root: server.root } : {}) }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(answer) } }
   })
   const results = new Map<string, string>()
@@ -100,6 +109,16 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
       return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     runs.push([...e.argv])
+    if (e.argv[0] === 'uv' && e.argv[1] === '--version') {
+      return { value: { exitCode: machine.uv ? 0 : 127, stdout: '', stderr: 'not found', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (e.argv[0] === 'sh' && (e.argv[2] ?? '').includes('astral.sh/uv/install.sh')) machine.uv = true
+    if (e.argv.includes('sync')) machine.venv = true
+    if (e.argv.includes('stop-server')) server.down = true
+    if (e.argv.slice(-2).join(' ') === 'claudevoice start') {
+      server.down = false
+      server.root = (e.argv[0] ?? '').replace(/\/\.venv\/bin\/python$/, '')
+    }
     const at = e.argv.indexOf('--result')
     if (at >= 0) {
       listener.done = false
@@ -130,12 +149,19 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   })
   on('turn.start', () => ({ turnId: 't0' }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
-  on('ui.toast', () => ({ value: undefined }))
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
   // The machine beneath: a venv already set up, a home folder.
   const answered = (path: string) => results.has(path) && (listener.answer === 'now' || listener.done)
-  on('fs.exists', (_, e) => ({ value: e.path.endsWith('/.venv/bin/python') || answered(e.path) || (opts.mac === true && e.path === '/usr/bin/osascript') }))
+  on('fs.exists', (_, e) => ({
+    value: (machine.venv && e.path.endsWith('/.venv/bin/python')) || answered(e.path) || (opts.mac === true && e.path === '/usr/bin/osascript')
+      || (machine.uv && e.path === '/home/tester/.local/bin/uv'),
+  }))
   // The project's files, and what is selected on screen.
-  const files = new Set(['/proj/notes.md', '/proj/docs/guide.pdf', '/home/tester/my notes.md', '/proj/README.md', '/proj/docs/guide.md'])
+  const files = new Set(['/proj/notes.md', '/proj/docs/guide.pdf', '/home/tester/my notes.md', '/proj/README.md', '/proj/docs/guide.md', '/apps/claude.app/Contents/MacOS/claude'])
   on('fs.stat', (_, e) => {
     if (!files.has(e.path)) throw Object.assign(new Error(`ENOENT: ${e.path}`), { code: 'ENOENT' })
     return { value: { kind: 'file' as const, size: 100, mtimeMs: 0, isLink: false } }
@@ -143,15 +169,16 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   on('session.cwd', () => ({ value: '/proj' }))
   const selection = { text: '' }
   on('ui.selection', () => ({ value: selection.text === '' ? undefined : { text: selection.text } }))
-  on('fs.read', (_, e) => ({ value: results.get(e.path) ?? '' }))
-  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/tester' : undefined }))
+  on('fs.read', (_, e) => ({ value: e.path.endsWith('/.claude-plugin/plugin.json') ? JSON.stringify({ version: '0.4.4' }) : (results.get(e.path) ?? '') }))
+  // The desktop app names the claude it runs: its folder, with the command in MacOS/.
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/tester' : e.name === 'CLAUDE_CODE_EXECPATH' ? '/apps/claude.app/Contents/' : undefined }))
   on('fs.write', (_, e) => {
     if (e.path.endsWith('listen.done')) listener.done = true
     written.push(e.path)
     writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics }
+  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics, toasts }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -730,4 +757,69 @@ test('Settings draw when a microphone is listed twice (Windows lists one per aud
   expect(mic?.props?.options?.map(o => o.value)).toEqual(['', 'Microphone (Realtek(R) Audio)', 'Headset Microphone (HyperX Clo'])
   expect(w.runs.some(argv => argv.slice(-3).join(' ') === 'config input_device Headset Microphone (HyperX Clo')).toBe(true)
   await pane.unmount()
+})
+
+test('A voice server an earlier version started is replaced by this one, once', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'read' })
+  const stops = () => w.runs.filter(argv => argv.includes('stop-server')).length
+  const starts = () => w.runs.filter(argv => argv.slice(-2).join(' ') === 'claudevoice start').length
+  expect(stops()).toBe(1)
+  expect(starts()).toBe(1)
+  expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('Hello')
+  await ui.press({ key: 'stop' })
+  // Now it is this version's own: used as it is.
+  await ui.press({ key: 'read' })
+  expect(stops()).toBe(1)
+  expect(starts()).toBe(1)
+  await ui.unmount()
+})
+
+test('On a fresh machine, Read aloud installs uv and the voice itself, saying so as it goes', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state, { fresh: true })
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'read' })
+  const installer = w.runs.findIndex(argv => argv[0] === 'sh' && (argv[2] ?? '').includes('astral.sh/uv/install.sh'))
+  const sync = w.runs.findIndex(argv => argv[0] === '/home/tester/.local/bin/uv' && argv[1] === 'sync')
+  expect(installer).toBeGreaterThanOrEqual(0)
+  expect(sync).toBeGreaterThan(installer)
+  expect(w.toasts.some(text => text.includes('Installing uv'))).toBe(true)
+  expect(w.toasts.some(text => text.includes('Setting up the voice'))).toBe(true)
+  expect(w.fetches.find(f => f.url.endsWith('/speak'))?.body).toContain('Hello')
+  await ui.unmount()
+})
+
+test('A newer version on GitHub is announced once, and Update now installs it', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state, { latest: '0.5.0' })
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(10)
+  expect(w.toasts.filter(text => text.includes('0.5.0 is out')).length).toBe(1)
+
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  expect(await pane.find({ type: 'Text', text: /0\.5\.0 is out \(you have 0\.4\.4\)/ })).toBeDefined()
+  await pane.press({ key: 'update-now' })
+  const claude = w.runs.filter(argv => argv[0] === '/apps/claude.app/Contents/MacOS/claude').map(argv => argv.slice(1).join(' '))
+  expect(claude).toEqual(['plugin marketplace update claudevoice', 'plugin update claudevoice@claudevoice'])
+  expect(w.toasts.some(text => text.includes('/reload-plugins'))).toBe(true)
+  expect(await pane.find({ key: 'update-now' })).toBeUndefined()
+  await pane.unmount()
+
+  // Looked again within a few hours: GitHub is not asked again.
+  const asked = () => w.fetches.filter(f => f.url.includes('raw.githubusercontent.com')).length
+  const before = asked()
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(10)
+  expect(asked()).toBe(before)
 })
