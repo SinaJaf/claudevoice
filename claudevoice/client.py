@@ -55,14 +55,13 @@ def ensure_server(base: str | None = None, *, startup_timeout: float = 300.0) ->
         print("claudevoice: uv not found (https://docs.astral.sh/uv/); start the server manually", file=sys.stderr)
         return False
     logf = open(config.SERVER_LOG_PATH, "ab")
-    detach = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
     subprocess.Popen(
         [*argv, "-m", "claudevoice.tts_server"],
         cwd=str(PROJECT_DIR),
         stdin=subprocess.DEVNULL,
         stdout=logf,
         stderr=logf,
-        **detach,  # survives the hook process exiting
+        **config.background(),  # survives the hook process exiting, with no window
     )
     deadline = time.time() + startup_timeout
     while time.time() < deadline:

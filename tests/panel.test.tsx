@@ -74,6 +74,8 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   // The listener answers through its --result file: at once ('now', as when Smart Turn
   // hears you finish), or only after Done ('on-done').
   const listener = { answer: 'now' as 'now' | 'on-done', done: false }
+  // The microphones the listener reports.
+  const mics = { list: [{ name: 'Built-in Microphone', default: true }] as { name: string; default: boolean }[] }
   // The clipboard, as wl-paste reads it (this test machine is neither a Mac nor Windows).
   const clip = { text: 'something copied long ago' }
   // On a Mac, the helper reports the clipboard (with its change count) and, asked about the
@@ -105,11 +107,13 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     }
     const isListen = e.argv.includes('claudevoice.listen') && !e.argv.includes('--warm')
     const isConfigRead = e.argv.includes('config') && e.argv.length === 4
-    const stdout = isListen
-      ? JSON.stringify({ text: 'what time is it', seconds: 2.1 })
-      : isConfigRead
-        ? JSON.stringify({ voice: 'af_heart', tts_engine: 'kokoro', stt_engine: 'local', whisper_model: 'mlx-community/whisper-large-v3-turbo', speed: 1.05, tts_voice: 'nova' })
-        : JSON.stringify({ ok: true })
+    const stdout = e.argv.includes('--devices')
+      ? JSON.stringify(mics.list)
+      : isListen
+        ? JSON.stringify({ text: 'what time is it', seconds: 2.1 })
+        : isConfigRead
+          ? JSON.stringify({ voice: 'af_heart', tts_engine: 'kokoro', stt_engine: 'local', whisper_model: 'mlx-community/whisper-large-v3-turbo', speed: 1.05, tts_voice: 'nova' })
+          : JSON.stringify({ ok: true })
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.close', () => ({ value: undefined }))
@@ -147,7 +151,7 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac }
+  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -702,4 +706,28 @@ test('On a Mac, with nothing highlighted, Read aloud reads the whole file open i
   await ui.press({ key: 'read' })
   expect(readBody(w)).toEqual({ text: 'Only this paragraph.', title: 'selection' })
   await ui.unmount()
+})
+
+test('Settings draw when a microphone is listed twice (Windows lists one per audio system)', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  mock.clock(on)
+  mock.store(on)
+  w.mics.list = [
+    { name: 'Microphone (Realtek(R) Audio)', default: true },
+    { name: 'Microphone (Realtek(R) Audio)', default: false },
+    { name: 'Headset Microphone (HyperX Clo', default: false },
+  ]
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const bar = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await bar.press({ key: 'settings' })
+  await bar.unmount()
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  expect(await pane.find({ key: 'microphone' })).toBeDefined()
+  await pane.select({ key: 'microphone', value: 'Headset Microphone (HyperX Clo' })
+  // Listed once each, the system default first.
+  const mic = await pane.find({ key: 'microphone' }) as { props?: { options?: { value: string }[] } } | undefined
+  expect(mic?.props?.options?.map(o => o.value)).toEqual(['', 'Microphone (Realtek(R) Audio)', 'Headset Microphone (HyperX Clo'])
+  expect(w.runs.some(argv => argv.slice(-3).join(' ') === 'config input_device Headset Microphone (HyperX Clo')).toBe(true)
+  await pane.unmount()
 })

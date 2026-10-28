@@ -1045,11 +1045,16 @@ async function settingsPane($: Engine, e: Surface) {
     { value: 'off', label: 'Off: only the gear stays, to turn it back on' },
   ]
   const listening: Option[] = LISTENING.map(([value, label]) => ({ value, label }))
+  // Each name once: a dropdown that lists a value twice is refused, and the whole pane with
+  // it (Windows lists a microphone once per audio system).
+  const micNames = new Set<string>()
   const microphones: Option[] = [
     { value: '', label: 'System default (follows your system)' },
-    ...(s._microphones ?? '').split('\n').filter(x => x !== '').map(line => {
+    ...(s._microphones ?? '').split('\n').filter(x => x !== '').flatMap(line => {
       const [name, tag] = line.split('\t') as [string, string | undefined]
-      return { value: name, label: tag ? `${name} ${tag}` : name }
+      if (name === '' || micNames.has(name)) return []
+      micNames.add(name)
+      return [{ value: name, label: tag ? `${name} ${tag}` : name }]
     }),
   ]
   const speaking: Option[] = [

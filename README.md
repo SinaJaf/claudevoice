@@ -147,6 +147,10 @@ Windows, in PowerShell:
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
+If it stops with "uv.exe ... is being used by another process", uv is already installed and in
+use (the plugin runs it while the Claude app is open): skip this step. To update uv later, run
+`uv self update`, or quit the Claude app and run the line above again.
+
 On Linux, also install the audio library: `sudo apt install libportaudio2` (Debian, Ubuntu),
 `sudo dnf install portaudio` (Fedora), `sudo pacman -S portaudio` (Arch).
 
@@ -254,6 +258,9 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
   to see the whole row, or widen the window.
 - "speech recognition is not allowed": turn on **Claude Voice transcription** in System Settings,
   Privacy & Security, Speech Recognition.
+- Windows: a black `python.exe` window stays open, and closing it stops the voice (0.4.2 and
+  earlier). Update the plugin, then close that window once: the voice server starts again,
+  hidden, the next time you press **Read aloud** or **● Call**.
 - Windows: "turn on Online speech recognition": Windows Settings, Privacy & security, Speech. The
   windows engine uses the default microphone (Settings, System, Sound, Input); pick Whisper in the
   gear to choose a specific one.

@@ -11,14 +11,30 @@ MIC_RATE = 16_000  # what Whisper expects
 
 
 def input_devices() -> list[dict]:
-    """The microphones sounddevice sees: [{"index", "name", "default": bool}, ...]."""
+    """The microphones sounddevice sees, each once: [{"index", "name", "default": bool}, ...].
+
+    Windows lists every microphone once per audio system (MME, DirectSound, WASAPI, WDM-KS);
+    only the default input's system is kept, the one recordings open through, and a name
+    seen twice is listed once.
+    """
     import sounddevice as sd
 
+    devices = sd.query_devices()
     default_index = sd.default.device[0]
-    out = []
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_input_channels"] > 0:
-            out.append({"index": i, "name": d["name"], "default": i == default_index})
+    try:
+        system = devices[default_index]["hostapi"]
+    except (IndexError, TypeError, KeyError):
+        system = None
+    out: list[dict] = []
+    seen: dict[str, dict] = {}
+    for i, d in enumerate(devices):
+        if d["max_input_channels"] <= 0 or (system is not None and d["hostapi"] != system):
+            continue
+        if d["name"] in seen:
+            seen[d["name"]]["default"] = seen[d["name"]]["default"] or i == default_index
+            continue
+        seen[d["name"]] = {"index": i, "name": d["name"], "default": i == default_index}
+        out.append(seen[d["name"]])
     return out
 
 

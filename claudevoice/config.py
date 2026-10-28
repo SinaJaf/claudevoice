@@ -20,6 +20,23 @@ LISTEN_DONE_FLAG = CONFIG_DIR / "listen.done"
 LISTEN_MUTE_FLAG = CONFIG_DIR / "listen.mute"  # "1" while the mic is muted
 LISTEN_LOCK = CONFIG_DIR / "listen.lock"  # only one microphone recording at a time
 
+# Windows process flags (subprocess has them only on Windows).
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def background() -> dict:
+    """Popen options for a process that outlives the one starting it, with no window.
+
+    On Windows the venv's python.exe is a launcher that starts the real interpreter. Started
+    with no console at all (DETACHED_PROCESS), the launcher's child gets a console window of
+    its own, and closing that window ends the process. CREATE_NO_WINDOW gives it a console
+    with no window instead, which the interpreter inherits.
+    """
+    if os.name == "nt":
+        return {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
 DEFAULTS: dict = {
     # Kokoro voice. Blend voices by listing several, e.g. "af_heart,af_bella".
     # See https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md

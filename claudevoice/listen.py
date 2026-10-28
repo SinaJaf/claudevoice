@@ -85,10 +85,9 @@ def _take_lock(timeout: float = 10.0):
 def _detach(argv: list[str]) -> None:
     """Run this listener again, minus --detach, in its own background process."""
     child = [sys.executable, "-m", "claudevoice.listen", *[a for a in argv if a != "--detach"]]
-    flags = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
     config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(config.CONFIG_DIR / "listen.log", "ab") as log:
-        subprocess.Popen(child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log, **flags)
+        subprocess.Popen(child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log, **config.background())
 
 
 def _emit(result: dict, path: str | None) -> None:
