@@ -17,6 +17,9 @@ export type ChatSettings = {
   microphone?: string
   speaking?: string
   speed?: string
+  sounds?: string
+  /** "on": this chat reads results aloud and says when it needs you, wherever you are. */
+  alwaysNotify?: string
 }
 
 /** A file or selection being read aloud: its name, the piece playing (or to resume
@@ -47,6 +50,8 @@ declare module 'claude-code' {
       patience: Patience
       reading: ReadingState
       versions: Versions
+      sounds: boolean
+      micElsewhere: boolean
     }
   }
 }

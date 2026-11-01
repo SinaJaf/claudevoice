@@ -2,4 +2,5 @@
 __pycache__/
 *.pyc
 *.wav
+!assets/*.wav
 .DS_Store

@@ -70,10 +70,15 @@ class TurnResult:
 
 
 class _ClaudeVoice:
-    """Watches whether Claude's voice is playing, and can stop it."""
+    """Watches whether a voice is playing, and can stop it.
 
-    def __init__(self, server: str) -> None:
+    Any chat's voice counts: another chat's, reading aloud through the same speakers,
+    must not be taken for you talking.
+    """
+
+    def __init__(self, server: str, owner: str = "") -> None:
         self.server = server.rstrip("/")
+        self.owner = owner
         self.speaking = False
         self._halt = threading.Event()
         threading.Thread(target=self._poll, daemon=True).start()
@@ -81,15 +86,17 @@ class _ClaudeVoice:
     def _poll(self) -> None:
         while not self._halt.is_set():
             try:
-                with urllib.request.urlopen(f"{self.server}/health", timeout=0.5) as r:
-                    self.speaking = bool(json.loads(r.read()).get("speaking"))
+                with urllib.request.urlopen(f"{self.server}/health?owner={self.owner}", timeout=0.5) as r:
+                    state = json.loads(r.read())
+                self.speaking = bool(state.get("busy", state.get("speaking")))
             except Exception:  # noqa: BLE001 - no server: nothing is playing
                 self.speaking = False
             self._halt.wait(0.15)
 
     def stop(self) -> None:
         try:
-            req = urllib.request.Request(f"{self.server}/stop", data=b"{}", method="POST",
+            body = json.dumps({"owner": self.owner, "current": True}).encode()
+            req = urllib.request.Request(f"{self.server}/stop", data=body, method="POST",
                                          headers={"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=1.0).read()
         except Exception:  # noqa: BLE001
@@ -138,11 +145,11 @@ class _LiveSettings:
 
 def live_turn(*, stop_event: threading.Event, paused, device: str = "", patience: str = "normal",
               talk_over: bool = True, server: str = "http://127.0.0.1:8765", max_seconds: float = 3600.0,
-              on_state=None, settings_file: str | None = None) -> TurnResult:
+              on_state=None, settings_file: str | None = None, owner: str = "") -> TurnResult:
     """Record one turn. `stop_event` ends it early (Done or Stop); `paused()` is Mute."""
     live = _LiveSettings(settings_file, patience, talk_over)
     vad, smart = SileroVAD(), SmartTurn()
-    claude = _ClaudeVoice(server)
+    claude = _ClaudeVoice(server, owner)
     q: "queue.Queue[np.ndarray]" = queue.Queue()
     mic = _Mic(device, VAD_CHUNK, q)
     mic.open(refresh=False)

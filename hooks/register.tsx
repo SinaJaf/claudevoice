@@ -36,12 +36,17 @@ const patience = atom({ plugin: 'claudevoice', key: 'patience' } as const, 'norm
 const NOT_READING: ReadingState = { title: '', at: 0, of: 0, paused: false }
 const reading = atom({ plugin: 'claudevoice', key: 'reading' } as const, NOT_READING)
 const versions = atom({ plugin: 'claudevoice', key: 'versions' } as const, { own: '', latest: '', updating: false } as Versions)
+// Notification sounds, for all chats (a chat may choose its own).
+const sounds = atom({ plugin: 'claudevoice', key: 'sounds' } as const, false)
+// Two chats side by side, both in a call: the other one holds the mic.
+const micElsewhere = atom({ plugin: 'claudevoice', key: 'micElsewhere' } as const, false)
 const MODE_STORE_KEY = 'callMode'
 const TALK_OVER_STORE_KEY = 'talkOver'
 const PATIENCE_STORE_KEY = 'patience'
 const CHAT_STORE_PREFIX = 'chat:'
 const SAME_AS_ALL = '__all__'
 const ENABLED_STORE_KEY = 'enabled'
+const SOUNDS_STORE_KEY = 'sounds'
 
 const SPOKEN_STYLE =
   'Voice call in progress: the user is speaking through a microphone and your final ' +
@@ -67,6 +72,16 @@ async function home($: Engine): Promise<string> {
 async function flagPath($: Engine, name: string): Promise<string> {
   const dir = (await $.env.get('CLAUDEVOICE_HOME')) ?? `${await home($)}/.claudevoice`
   return `${dir}/${name}`
+}
+
+/** This chat's id, as the voice server and this chat's own listener know it. */
+async function chatId($: Engine): Promise<string> {
+  return (await $.session.id()).replace(/[^A-Za-z0-9_-]/g, '')
+}
+
+/** ~/.claudevoice/chats/<id>/<name>: what this chat and its own listener say to each other. */
+async function chatPath($: Engine, name: string): Promise<string> {
+  return flagPath($, `chats/${await chatId($)}/${name}`)
 }
 
 /** uv, wherever the installer put it: GUI apps start with a short PATH. */
@@ -156,11 +171,14 @@ async function ensurePython($: Engine): Promise<boolean> {
 
 // ---- talking to the Kokoro server --------------------------------------------
 
-type Health = { speaking: boolean; last_error?: string; reading?: ReadingState | null; root?: string }
+// speaking and reading are this chat's; busy is any chat's voice; held: this chat's speech is paused.
+type Health = { speaking: boolean; busy?: boolean; held?: boolean; last_error?: string; reading?: ReadingState | null; root?: string }
 
 async function health($: Engine): Promise<Health | null> {
   try {
-    const r = await $.http.fetch(`${SERVER}/health`)
+    const r = await $.http.fetch(`${SERVER}/health?owner=${await chatId($)}`)
+    // A server from before chats had their own voice: no folder to match, so it gets replaced.
+    if (r.status === 404) return { speaking: false, root: '' }
     return r.ok ? (JSON.parse(r.text) as Health) : null
   } catch {
     return null
@@ -313,6 +331,7 @@ async function setChatSetting($: Engine, key: keyof ChatSettings, value: string)
   else await $.store.set(storeKey, next)
   if (key === 'plugin' && !(await isEnabled($))) await quiet($)
   if (key === 'patience' || key === 'talkOver') await shareLiveSettings($)
+  if (key === 'sounds' && value === 'on') void sampleSounds($)
   if (key === 'listening' && value.startsWith('local:')) await ensureWhisper($)
 }
 
@@ -354,12 +373,20 @@ async function listenOverrides($: Engine): Promise<string[]> {
 /** Tell the listener this chat's pause length and talk-over. A running listener re-reads
  *  this file, so a change in the gear applies to the turn already listening. */
 async function shareLiveSettings($: Engine): Promise<void> {
-  await touch($, 'listen.settings', JSON.stringify({ patience: await patienceHere($), talk_over: await talkOverHere($) }))
+  await touchChat($, 'listen.settings', JSON.stringify({ patience: await patienceHere($), talk_over: await talkOverHere($) }))
 }
 
 async function touch($: Engine, name: string, text = ''): Promise<void> {
   try {
     await $.fs.write(await flagPath($, name), text)
+  } catch {
+    // no flag: the listener carries on as it was
+  }
+}
+
+async function touchChat($: Engine, name: string, text = ''): Promise<void> {
+  try {
+    await $.fs.write(await chatPath($, name), text)
   } catch {
     // no flag: the listener carries on as it was
   }
@@ -380,7 +407,7 @@ async function voiceFields($: Engine): Promise<Record<string, unknown>> {
 
 async function speak($: Engine, text: string): Promise<boolean> {
   if (!(await ensureServer($))) return false
-  const body = { text, interrupt: true, ...(await voiceFields($)) }
+  const body = { text, interrupt: true, owner: await chatId($), front: await isHere($), ...(await voiceFields($)) }
   try {
     const r = await $.http.fetch(`${SERVER}/speak`, {
       method: 'POST',
@@ -393,12 +420,22 @@ async function speak($: Engine, text: string): Promise<boolean> {
   }
 }
 
-async function stopSpeaking($: Engine): Promise<void> {
+/** Tell the voice server something about this chat's speech; false when it isn't running or says no. */
+async function tellServer($: Engine, path: string, body: Record<string, unknown> = {}): Promise<boolean> {
   try {
-    await $.http.fetch(`${SERVER}/stop`, { method: 'POST', body: '{}' })
+    const r = await $.http.fetch(`${SERVER}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owner: await chatId($), ...body }),
+    })
+    return r.ok
   } catch {
-    // server not up: nothing is playing
+    return false
   }
+}
+
+async function stopSpeaking($: Engine): Promise<void> {
+  await tellServer($, '/stop')
 }
 
 
@@ -488,6 +525,12 @@ async function readLastReply($: Engine): Promise<void> {
   if (!(await speak($, last.text))) return
   await setPhase($, 'speaking')
   watchPlayback($)
+}
+
+// What Claude waits on you for, by tool, in words that follow "Claude needs".
+const WAITS_ON_YOU: Record<string, string> = {
+  AskUserQuestion: 'your answer to a question',
+  ExitPlanMode: 'you to approve a plan',
 }
 
 // ---- what you highlighted or copied ------------------------------------------------------
@@ -637,7 +680,7 @@ async function findFile($: Engine, name: string): Promise<FileToRead | null> {
 async function readDocument($: Engine, what: FileToRead | { text: string; title: string }): Promise<void> {
   if (!(await ensureServer($))) return
   let answer: { ok?: boolean; error?: string; title?: string; pages?: number } = {}
-  const body = JSON.stringify({ ...what, ...(await voiceFields($)) })
+  const body = JSON.stringify({ ...what, owner: await chatId($), front: await isHere($), ...(await voiceFields($)) })
   try {
     let r = await $.http.fetch(`${SERVER}/read`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
     if (r.status === 404 && (await restartServer($))) {
@@ -665,22 +708,12 @@ async function readDocument($: Engine, what: FileToRead | { text: string; title:
 
 /** Pause a reading; Resume carries on from the sentence it stopped in. */
 async function pauseReading($: Engine): Promise<void> {
-  try {
-    await $.http.fetch(`${SERVER}/pause`, { method: 'POST', body: '{}' })
-  } catch {
-    // server gone: nothing is playing
-  }
+  await tellServer($, '/pause')
 }
 
 async function resumeReading($: Engine): Promise<void> {
   if (!(await ensureServer($))) return
-  try {
-    const r = await $.http.fetch(`${SERVER}/read`, { method: 'POST', body: JSON.stringify({ resume: true }) })
-    if (!r.ok) {
-      await update($, reading, () => NOT_READING)
-      return
-    }
-  } catch {
+  if (!(await tellServer($, '/read', { resume: true, front: await isHere($) }))) {
     await update($, reading, () => NOT_READING)
     return
   }
@@ -700,6 +733,7 @@ function watchPlayback($: Engine): void {
         watchPlayback($)
         return
       }
+      if (voiceLeftBehind) return // you left mid-sentence; cameBack carries on from there
       if (h?.last_error) {
         await update($, note, () => h.last_error ?? '')
         $.ui.toast(h.last_error)
@@ -721,16 +755,16 @@ async function listenOnce($: Engine): Promise<void> {
   if ((await read($, take)) !== '') return // one listener at a time, and it is already listening
   // While Claude is still talking (live mode), the phase stays 'speaking' until it stops.
   if ((await read($, phase)) !== 'speaking') await setPhase($, 'listening')
-  const session = (await $.session.id()).replace(/[^A-Za-z0-9_-]/g, '')
+  const session = await chatId($)
   const resultPath = await flagPath($, `listen-${session}-${await $.clock.now()}.json`)
   // The heartbeat tells the listener someone is still waiting; it gives up if it goes stale.
-  const heartbeat = await flagPath($, 'listen.alive')
-  await touch($, 'listen.alive', String(await $.clock.now()))
+  const heartbeat = await chatPath($, 'listen.alive')
+  await touchChat($, 'listen.alive', String(await $.clock.now()))
   const how = (await modeHere($)) === 'live'
     ? ['--live', `--patience=${await patienceHere($)}`, (await talkOverHere($)) ? '--talk-over' : '--no-talk-over']
     : ['--manual']
   const argv = [...(await python($)), '-m', 'claudevoice.listen', ...(await listenOverrides($)),
-    ...how, '--result', resultPath, '--heartbeat', heartbeat, '--detach']
+    ...how, '--chat', session, '--result', resultPath, '--heartbeat', heartbeat, '--detach']
   await update($, take, () => resultPath)
   await shareLiveSettings($)
   const ran = await $.process.run(argv, { cwd: root($), timeoutMs: 60000 })
@@ -748,7 +782,9 @@ function awaitTake($: Engine, resultPath: string): void {
     void (async () => {
       if (!(await read($, isCall))) return // hung up: the listener was told to stop
       if ((await read($, take)) !== resultPath) return // a newer listener took over
-      await touch($, 'listen.alive', String(await $.clock.now()))
+      await touchChat($, 'listen.alive', String(await $.clock.now()))
+      await checkPresence($) // the events say when you move; this catches any one that went astray
+      await applyMic($)
       await followListener($)
       let raw = ''
       try {
@@ -769,7 +805,7 @@ function awaitTake($: Engine, resultPath: string): void {
 async function followListener($: Engine): Promise<void> {
   let state = ''
   try {
-    const path = await flagPath($, 'listen.state')
+    const path = await chatPath($, 'listen.state')
     if (await $.fs.exists(path)) state = String(await $.fs.read(path)).trim()
   } catch {
     state = ''
@@ -821,7 +857,9 @@ async function startCall($: Engine): Promise<void> {
   if (await read($, isCall)) return
   await update($, isCall, () => true)
   await update($, muted, () => false)
-  await touch($, 'listen.mute', '0')
+  micFlag = ''
+  await claimMic($)
+  await applyMic($)
   await update($, note, () => '')
   await setPhase($, 'loading')
   if (!(await ensureServer($))) {
@@ -856,33 +894,225 @@ async function endCall($: Engine, reason: string): Promise<void> {
   await update($, take, () => '')
   await update($, hearing, () => '')
   await update($, muted, () => false)
-  await touch($, 'listen.mute', '0')
+  await update($, micElsewhere, () => false)
+  heldReply = ''
+  voiceLeftBehind = false
+  await releaseMic($)
+  micFlag = ''
+  await touchChat($, 'listen.mute', '0')
   await setPhase($, 'idle')
   await update($, note, () => reason)
-  await touch($, 'listen.stop')
+  await touchChat($, 'listen.stop')
   await stopSpeaking($)
 }
 
 /** Finish talking: what you said goes to Claude. */
 async function done($: Engine): Promise<void> {
   if ((await read($, phase)) !== 'listening') return
-  await touch($, 'listen.done')
+  await touchChat($, 'listen.done')
   await setPhase($, 'transcribing') // the listener now turns what you said into text
 }
 
 /** Mute pauses the mic: nothing is recorded while muted, what came before is kept,
  *  Unmute carries on the same take, and Done still sends it. */
 async function toggleMute($: Engine): Promise<void> {
-  const next = !(await read($, muted))
-  await update($, muted, () => next)
-  await touch($, 'listen.mute', next ? '1' : '0')
+  if (await read($, micElsewhere)) {
+    // Side by side with another call that held the mic: Unmute brings it here.
+    await claimMic($)
+    await update($, muted, () => false)
+  } else {
+    await update($, muted, m => !m)
+  }
+  await applyMic($)
 }
 
 /** Stop Claude's voice, and forget any reading; in a call the mic opens right away. */
 async function stop($: Engine): Promise<void> {
   await stopSpeaking($) // in a call, watchPlayback notices and listens again
+  heldReply = ''
+  voiceLeftBehind = false
   await update($, reading, () => NOT_READING)
   if (!(await read($, isCall))) await setPhase($, 'idle')
+}
+
+// ---- which chat you are in ---------------------------------------------------------------
+// Every chat runs its own copy of this plugin, and a window showing a chat attaches to it:
+// moving to another chat detaches. So a chat with no surface is one you are not in. There
+// its mic is muted and its voice waits, unless you asked this chat to always notify you.
+
+let wasHere: boolean | null = null // as last seen; null: not yet
+let voiceLeftBehind = false // this chat's voice was paused because you left; it carries on when you return
+let heldReply = '' // a call's reply that finished while you were away, read when you return
+let micFlag = '' // what this chat's listen.mute last said
+let lastAttention: number | null = null
+
+async function isHere($: Engine): Promise<boolean> {
+  return (await $.session.surfaces()).length > 0
+}
+
+async function alwaysNotify($: Engine): Promise<boolean> {
+  return (await read($, chat)).alwaysNotify === 'on'
+}
+
+/** Act on you having moved to or from this chat. */
+async function checkPresence($: Engine): Promise<void> {
+  const here = await isHere($)
+  const before = wasHere
+  wasHere = here
+  if (before === null || before === here) return
+  if (here) await cameBack($)
+  else await wentAway($)
+}
+
+async function wentAway($: Engine): Promise<void> {
+  await releaseMic($)
+  await applyMic($)
+  if (await alwaysNotify($)) {
+    await tellServer($, '/front', { front: false })
+    return
+  }
+  if ((await health($))?.speaking === true) {
+    voiceLeftBehind = true
+    await tellServer($, '/pause')
+  }
+}
+
+async function cameBack($: Engine): Promise<void> {
+  await tellServer($, '/front', { front: true })
+  if (await read($, isCall)) await claimMic($)
+  await applyMic($)
+  if (heldReply !== '') {
+    const reply = heldReply
+    heldReply = ''
+    voiceLeftBehind = false
+    await sayReply($, reply)
+  } else if (voiceLeftBehind) {
+    voiceLeftBehind = false
+    await resumeReading($)
+  }
+}
+
+// The one microphone goes to the chat you are in. Two chats on screen side by side both count
+// as "in", so the file ~/.claudevoice/mic.owner names the one you last used for a call.
+const MIC_OWNER = 'mic.owner'
+
+async function micOwner($: Engine): Promise<string> {
+  try {
+    const path = await flagPath($, MIC_OWNER)
+    return (await $.fs.exists(path)) ? String(await $.fs.read(path)).trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+async function claimMic($: Engine): Promise<void> {
+  await touch($, MIC_OWNER, await chatId($))
+}
+
+async function releaseMic($: Engine): Promise<void> {
+  if ((await micOwner($)) === (await chatId($))) await touch($, MIC_OWNER, '')
+}
+
+/** This chat's mic is open only if you are here, haven't muted it, and no other chat holds it. */
+async function applyMic($: Engine): Promise<void> {
+  const here = await isHere($)
+  const owner = await micOwner($)
+  const elsewhere = here && owner !== '' && owner !== (await chatId($))
+  if (elsewhere !== (await read($, micElsewhere))) await update($, micElsewhere, () => elsewhere)
+  const flag = (await read($, muted)) || !here || elsewhere ? '1' : '0'
+  if (flag === micFlag) return
+  micFlag = flag
+  await touchChat($, 'listen.mute', flag)
+}
+
+/** Speak a finished reply in this chat; in a call, the mic stays or goes open for your turn. */
+async function sayReply($: Engine, answer: string): Promise<void> {
+  const inCall = await read($, isCall)
+  if (await speak($, answer)) {
+    await setPhase($, 'speaking')
+    watchPlayback($)
+    // Live: the mic opens while Claude talks, so you can talk over it.
+    if (inCall && (await modeHere($)) === 'live') void listenOnce($)
+  } else if (inCall) {
+    void listenOnce($)
+  }
+}
+
+/** The chat's name when it speaks up from elsewhere: its project folder. */
+async function chatName($: Engine): Promise<string> {
+  return (await $.session.cwd()).replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? ''
+}
+
+/** A turn ended. You hear it if you are in a call in this chat, or if this chat always
+ *  notifies you; otherwise a sound says it is ready, and a call's reply waits for you. */
+async function finishedTurn($: Engine, answer: string, isAborted: boolean): Promise<void> {
+  if (!(await isEnabled($))) return
+  const inCall = await read($, isCall)
+  if (isAborted || answer === '') {
+    if (inCall) void listenOnce($)
+    return
+  }
+  const here = await isHere($)
+  const always = await alwaysNotify($)
+  if (always || (inCall && here)) {
+    await sayReply($, here ? answer : `From ${await chatName($)}. ${answer}`)
+    return
+  }
+  await chime($, 'done')
+  if (inCall) {
+    heldReply = answer
+    await setPhase($, 'listening')
+  }
+}
+
+/** This chat is waiting on you: a question, a plan or a permission. */
+async function needsYou($: Engine, what: string): Promise<void> {
+  if (!(await isEnabled($))) return
+  // One wait can be announced by more than one event.
+  const now = await $.clock.now()
+  if (lastAttention !== null && now - lastAttention < 3000) return
+  lastAttention = now
+  await chime($, 'attention')
+  if (!(await alwaysNotify($))) return
+  const inCall = await read($, isCall)
+  const from = (await isHere($)) ? '' : `In ${await chatName($)}, `
+  if ((await speak($, `${from}Claude needs ${what}.`)) && !inCall) {
+    await setPhase($, 'speaking')
+    watchPlayback($)
+  }
+}
+
+// ---- notification sounds ------------------------------------------------------------------
+
+type Chime = 'done' | 'attention'
+
+async function soundsOn($: Engine): Promise<boolean> {
+  const own = (await read($, chat)).sounds
+  return own !== undefined ? own === 'on' : read($, sounds)
+}
+
+/** Play a sound if this chat has sounds on, with the machine's own player. */
+async function chime($: Engine, kind: Chime): Promise<void> {
+  if (await soundsOn($)) await playSound($, kind)
+}
+
+async function playSound($: Engine, kind: Chime): Promise<void> {
+  const file = `${root($)}/assets/${kind}.wav`
+  const players: string[][] = (await $.fs.exists('/usr/bin/afplay'))
+    ? [['/usr/bin/afplay', file]]
+    : (await $.env.get('OS')) === 'Windows_NT'
+      ? [['powershell', '-NoProfile', '-Command', `(New-Object Media.SoundPlayer '${file.replace(/'/g, "''")}').PlaySync()`]]
+      : [['paplay', file], ['aplay', '-q', file]]
+  for (const argv of players) {
+    const ran = await $.process.run(argv, { timeoutMs: 10000 }).catch(() => null)
+    if (ran?.exitCode === 0) return
+  }
+}
+
+/** Both sounds in turn, when sounds are switched on, so you know what each means. */
+async function sampleSounds($: Engine): Promise<void> {
+  await playSound($, 'done')
+  await playSound($, 'attention')
 }
 
 // ---- settings ----------------------------------------------------------------------
@@ -1020,7 +1250,7 @@ type Status = { glyph: string; color: string; word: string; progress: string }
 async function status($: Engine, narrow = false): Promise<Status | null> {
   const current = await read($, phase)
   const t = await read($, tick)
-  const isMuted = await read($, muted)
+  const isMuted = (await read($, muted)) || (await read($, micElsewhere))
   const heardNow = await read($, hearing)
   const r = await read($, reading)
   if (current === 'idle') {
@@ -1079,7 +1309,7 @@ async function controls($: Engine, e: Surface, compact: boolean) {
         {isReading && <Text> </Text>}
         {inCall && current === 'listening' && <Button key="done" label="Done" hotkey="d" variant="primary" onPress={() => void done($)} />}
         {inCall && current === 'listening' && <Text> </Text>}
-        {inCall && current === 'listening' && <Button key="mute" label={(await read($, muted)) ? 'Unmute' : 'Mute'} hotkey="u" plain onPress={() => void toggleMute($)} />}
+        {inCall && current === 'listening' && <Button key="mute" label={(await read($, muted)) || (await read($, micElsewhere)) ? 'Unmute' : 'Mute'} hotkey="u" plain onPress={() => void toggleMute($)} />}
         {inCall && current === 'listening' && <Text> </Text>}
         {(current === 'speaking' || (isReading && r.paused)) && <Button key="stop" label="Stop" hotkey="s" plain onPress={() => void stop($)} />}
         {(current === 'speaking' || (isReading && r.paused)) && <Text> </Text>}
@@ -1111,7 +1341,7 @@ async function footer($: Engine, e: Surface, modes: readonly string[]) {
   const isOn = await isEnabled($)
   const current = await read($, phase)
   const inCall = await read($, isCall)
-  const isMuted = await read($, muted)
+  const isMuted = (await read($, muted)) || (await read($, micElsewhere))
   const micOpen = inCall && (await read($, take)) !== ''
   const r = await read($, reading)
   const isReading = !inCall && r.title !== ''
@@ -1221,11 +1451,20 @@ async function settingsPane($: Engine, e: Surface) {
     { value: 'long9', label: 'Long ×9: waits 4 minutes of silence' },
     { value: 'long10', label: 'Long ×10: waits 5 minutes of silence' },
   ]
+  const soundChoices: Option[] = [
+    { value: 'off', label: 'Off' },
+    { value: 'on', label: 'On: one sound when a result is ready, another when Claude needs you' },
+  ]
+  const alwaysChoices: Option[] = [
+    { value: 'off', label: 'Off: this chat only speaks while I am in it' },
+    { value: 'on', label: 'On: read results aloud and say when it needs me, wherever I am' },
+  ]
   const onOff: Option[] = [
     { value: 'on', label: 'On: talking while Claude speaks stops its voice' },
     { value: 'off', label: 'Off (better without headphones)' },
   ]
   const { own: ownShown, latest: latestShown, updating: isUpdating } = await read($, versions)
+  const soundsAll = await read($, sounds)
   const mode = await read($, listenMode)
   const pause = await read($, patience)
   const over = await read($, talkOver)
@@ -1281,6 +1520,22 @@ async function settingsPane($: Engine, e: Surface) {
       <Text dimColor>Each choice applies to all chats. Open "this chat" under a setting to change it for this chat only.</Text>
       <Box marginTop={1} flexDirection="column">
         {row('plugin', 'Voice plugin', plugin, isOn ? 'on' : 'off', (v: string) => void setEnabled($, v === 'on'), true)}
+        {row('sounds', 'Notification sounds', soundChoices, soundsAll ? 'on' : 'off', (v: string) => {
+          void (async () => {
+            await update($, sounds, () => v === 'on')
+            if (v === 'on') await sampleSounds($)
+          })()
+          remember(SOUNDS_STORE_KEY, v === 'on')
+        })}
+        <Box key="row-always" flexDirection="column" marginTop={1}>
+          <Text>Always notify me from this chat</Text>
+          <Select
+            key="alwaysNotify"
+            options={alwaysChoices}
+            value={here.alwaysNotify === 'on' ? 'on' : 'off'}
+            onSelect={(v: string) => void setChatSetting($, 'alwaysNotify', v === 'on' ? 'on' : SAME_AS_ALL)}
+          />
+        </Box>
         {row('listenMode', 'When you talk', modes, mode, (v: string) => {
           void update($, listenMode, () => (v === 'hold' ? 'hold' : 'live'))
           remember(MODE_STORE_KEY, v)
@@ -1336,6 +1591,9 @@ export const register: Register = on => {
     await update($, patience, () => asPatience(savedPatience))
     const savedTalkOver = await $.store.get(TALK_OVER_STORE_KEY)
     await update($, talkOver, () => savedTalkOver !== false)
+    const savedSounds = await $.store.get(SOUNDS_STORE_KEY)
+    await update($, sounds, () => savedSounds === true)
+    wasHere = await isHere($)
     const savedChat = await $.store.get(await chatStoreKey($))
     await update($, chat, () => (savedChat !== null && typeof savedChat === 'object' ? (savedChat as ChatSettings) : {}))
     void checkForUpdate($)
@@ -1366,6 +1624,36 @@ export const register: Register = on => {
     return { text: 'Voice pane opened.' }
   })
 
+  // You moved to or from this chat.
+  on('session.attach', async ($, e, next) => {
+    const result = await next(e)
+    $.clock.after(0, () => void checkPresence($))
+    return result
+  })
+  on('session.detach', async ($, e, next) => {
+    const result = await next(e)
+    if (e.reason !== 'end') $.clock.after(0, () => void checkPresence($))
+    return result
+  })
+
+  // This chat is waiting on you. A question or a plan goes through the permission check on its
+  // way to you; a prompt raises PermissionRequest and, where the engine says so, a notification.
+  // An `ask` verdict alone is no sign: in Auto mode it may go to the mode's own decider and
+  // never reach you. needsYou makes one announcement of the events one wait raises.
+  on('tool.check', async ($, e, next) => {
+    const what = e.tool_use_id === undefined ? undefined : WAITS_ON_YOU[e.tool]
+    if (what !== undefined) void needsYou($, what)
+    return next(e)
+  })
+  on('classic.PermissionRequest', async ($, e, next) => {
+    void needsYou($, WAITS_ON_YOU[e.tool_name] ?? `your permission to use ${e.tool_name.replace(/^mcp__[^_]+__/, '')}`)
+    return next(e)
+  })
+  on('classic.Notification', async ($, e, next) => {
+    if (e.notification_type === 'permission_prompt' || e.notification_type === 'elicitation_dialog') void needsYou($, 'your attention')
+    return next(e)
+  })
+
   // While a call is on, Claude answers in spoken style.
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
@@ -1381,33 +1669,24 @@ export const register: Register = on => {
   })
 
   on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) heldReply = '' // a newer turn: that reply is no longer the latest
     if (e.agentId === undefined && (await read($, isCall))) await setPhase($, 'thinking')
     return next(e)
   })
 
-  // In a call, every finished reply is spoken, and the mic opens for your turn.
+  // A reply is ready: read aloud if you should hear it now, otherwise a sound, and a call's reply waits.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId !== undefined || !(await read($, isCall))) return result
+    if (e.agentId !== undefined) return result
     const answer = e.answer.trim()
-    $.clock.after(0, () => {
-      void (async () => {
-        if (answer !== '' && !e.isAborted && (await speak($, answer))) {
-          await setPhase($, 'speaking')
-          watchPlayback($)
-          // Live: the mic opens while Claude talks, so you can talk over it.
-          if ((await modeHere($)) === 'live') void listenOnce($)
-        } else {
-          void listenOnce($)
-        }
-      })()
-    })
+    $.clock.after(0, () => void finishedTurn($, answer, e.isAborted))
     return result
   })
 
   // Any plugin's $.audio.speak (the platform `say` voice) goes through Kokoro instead.
   on('audio.speak', async ($, e, next) => {
     if (!(await isEnabled($))) return next(e)
+    if (!(await isHere($)) && !(await alwaysNotify($))) return { value: { via: 'system' as const } }
     if (await speak($, e.text)) {
       await setPhase($, 'speaking')
       watchPlayback($)

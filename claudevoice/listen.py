@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,13 +28,14 @@ from .stt import make_transcriber
 
 HOLD_MAX_SECONDS = 3600.0  # one hour: a runaway guard; only Done ends a hold-mode take
 RESULT_MAX_AGE = 24 * 3600  # result files older than this are swept
+CHAT_MAX_AGE = 14 * 24 * 3600  # a chat's folder untouched for this long is swept
 HEARTBEAT_STALE = 20.0  # no heartbeat from the plugin for this long: nobody is waiting, stop
-_preempted = threading.Event()  # a newer listener took the mic, or the plugin went away
+_preempted = threading.Event()  # a newer listener in this chat took over, or the plugin went away
 
 
-def _try_lock():
-    config.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    handle = open(config.LISTEN_LOCK, "a+")
+def _try_lock(files: config.ListenFiles):
+    files.dir.mkdir(parents=True, exist_ok=True)
+    handle = open(files.lock, "a+")
     try:
         if os.name == "nt":
             import msvcrt
@@ -50,18 +52,18 @@ def _try_lock():
     return handle
 
 
-def _take_lock(timeout: float = 10.0):
-    """Hold the microphone for this recording, taking it over from any older listener.
+def _take_lock(files: config.ListenFiles, timeout: float = 10.0):
+    """Hold this chat's recording, taking it over from any older listener in the same chat.
 
-    One listener at a time, so the same words are never sent twice. The newest one
-    wins: an older listener (a call that was abandoned, a reloaded plugin) is told
-    to stop and gives up its take. The OS drops the lock when a process ends.
+    One listener at a time in a chat, so the same words are never sent twice. The newest
+    one wins: an older listener (a reloaded plugin) is told to stop and gives up its take.
+    Other chats have listeners of their own, muted while you are not in them. The OS drops
+    the lock when a process ends.
     """
-    handle = _try_lock()
+    handle = _try_lock(files)
     if handle is None:
-        pid_file = config.CONFIG_DIR / "listen.pid"
         try:
-            old = int(pid_file.read_text().strip())
+            old = int(files.pid.read_text().strip())
         except (OSError, ValueError):
             old = 0
         if old and old != os.getpid():
@@ -76,9 +78,9 @@ def _take_lock(timeout: float = 10.0):
         deadline = time.time() + timeout
         while handle is None and time.time() < deadline:
             time.sleep(0.1)
-            handle = _try_lock()
+            handle = _try_lock(files)
     if handle is not None:
-        (config.CONFIG_DIR / "listen.pid").write_text(str(os.getpid()))
+        files.pid.write_text(str(os.getpid()))
     return handle
 
 
@@ -109,6 +111,13 @@ def _sweep_results() -> None:
                 old.unlink()
         except OSError:
             pass
+    if config.CHATS_DIR.is_dir():
+        for chat in config.CHATS_DIR.iterdir():
+            try:
+                if now - chat.stat().st_mtime > CHAT_MAX_AGE:
+                    shutil.rmtree(chat, ignore_errors=True)
+            except OSError:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -145,6 +154,7 @@ def _listen(argv: list[str], result_path: str | None) -> int:
     ap.add_argument("--parakeet", default=None, choices=["v2", "v3"], help="Parakeet model")
     ap.add_argument("--device", default=None, help="microphone name; empty for the system default")
     ap.add_argument("--result", default=None, help="also write the JSON answer to this file")
+    ap.add_argument("--chat", default="", help="the chat this listener belongs to; its flags are its own")
     ap.add_argument("--live", action="store_true",
                     help="live mode: end the turn when you have finished talking (Smart Turn)")
     ap.add_argument("--patience", choices=["short", "normal", "long"] + [f"long{n}" for n in range(2, 11)], default="normal",
@@ -168,11 +178,12 @@ def _listen(argv: list[str], result_path: str | None) -> int:
         print(json.dumps(input_devices()))
         return 0
 
+    files = config.ListenFiles(args.chat)
     if not args.warm:
         # SIGTERM from a newer listener: give up this take quietly.
         if os.name != "nt":
             signal.signal(signal.SIGTERM, lambda *_: _preempted.set())
-        lock = _take_lock()
+        lock = _take_lock(files)
         if lock is None:
             _emit({"text": "", "seconds": 0, "busy": True}, result_path)
             return 0
@@ -184,8 +195,8 @@ def _listen(argv: list[str], result_path: str | None) -> int:
     _sweep_results()
     t0 = time.time()
     stop_event = threading.Event()
-    config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
-    config.LISTEN_DONE_FLAG.unlink(missing_ok=True)
+    files.stop.unlink(missing_ok=True)
+    files.done.unlink(missing_ok=True)
 
     muted = threading.Event()
 
@@ -204,10 +215,10 @@ def _listen(argv: list[str], result_path: str | None) -> int:
             if _preempted.is_set() or orphaned():
                 _preempted.set()
                 stop_event.set()
-            if config.LISTEN_STOP_FLAG.exists() or config.LISTEN_DONE_FLAG.exists():
+            if files.stop.exists() or files.done.exists():
                 stop_event.set()
             try:
-                is_muted = config.LISTEN_MUTE_FLAG.read_text().strip() == "1"
+                is_muted = files.mute.read_text().strip() == "1"
             except OSError:
                 is_muted = False
             if is_muted:
@@ -218,11 +229,11 @@ def _listen(argv: list[str], result_path: str | None) -> int:
 
     if getattr(stt, "live", False):
         # Windows: the system recognizer listens to the mic itself and watches the same flags.
-        result = stt.listen(done_flag=config.LISTEN_DONE_FLAG, stop_flag=config.LISTEN_STOP_FLAG,
-                            mute_flag=config.LISTEN_MUTE_FLAG, heartbeat=heartbeat,
+        result = stt.listen(done_flag=files.done, stop_flag=files.stop,
+                            mute_flag=files.mute, heartbeat=heartbeat,
                             max_seconds=HOLD_MAX_SECONDS if args.manual else args.max_seconds)
-        config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
-        config.LISTEN_DONE_FLAG.unlink(missing_ok=True)
+        files.stop.unlink(missing_ok=True)
+        files.done.unlink(missing_ok=True)
         result.setdefault("text", "")
         result["seconds"] = round(time.time() - t0, 1)
         result["device"] = "default microphone"
@@ -232,7 +243,7 @@ def _listen(argv: list[str], result_path: str | None) -> int:
     threading.Thread(target=watch_flags, daemon=True).start()
 
     if args.live:
-        return _live(args, cfg, stt, stop_event, muted, t0, result_path)
+        return _live(args, cfg, stt, stop_event, muted, t0, result_path, files)
 
     # Hold mode: pauses never end the recording; only the Done button does (or the cap).
     silence = 1e9 if args.manual else cfg["silence_seconds"]
@@ -242,10 +253,10 @@ def _listen(argv: list[str], result_path: str | None) -> int:
     audio = record(silence_seconds=silence, threshold=cfg["vad_threshold"],
                    max_seconds=max_seconds, stop_event=stop_event,
                    device=cfg.get("input_device", ""), info=used, paused=muted.is_set)
-    cancelled = config.LISTEN_STOP_FLAG.exists() or _preempted.is_set()
+    cancelled = files.stop.exists() or _preempted.is_set()
     stop_event.set()
-    config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
-    config.LISTEN_DONE_FLAG.unlink(missing_ok=True)
+    files.stop.unlink(missing_ok=True)
+    files.done.unlink(missing_ok=True)
     if cancelled:
         _emit({"text": "", "seconds": 0, "cancelled": True}, result_path)
         return 0
@@ -261,15 +272,13 @@ def _listen(argv: list[str], result_path: str | None) -> int:
 
 
 def _live(args, cfg: dict, stt, stop_event: threading.Event, muted: threading.Event, t0: float,
-          result_path: str | None) -> int:
+          result_path: str | None, files: config.ListenFiles) -> int:
     """Live mode: one conversational turn, ended by Smart Turn, a long pause, or Done."""
     from .live import live_turn
 
-    state_file = config.CONFIG_DIR / "listen.state"
-
     def on_state(state: str) -> None:
         try:
-            state_file.write_text(state)
+            files.state.write_text(state)
         except OSError:
             pass
 
@@ -278,11 +287,11 @@ def _live(args, cfg: dict, stt, stop_event: threading.Event, muted: threading.Ev
     turn = live_turn(stop_event=stop_event, paused=muted.is_set, device=cfg.get("input_device", ""),
                      patience=args.patience, talk_over=args.talk_over, server=config.server_url(cfg),
                      max_seconds=HOLD_MAX_SECONDS, on_state=on_state,
-                     settings_file=str(config.CONFIG_DIR / "listen.settings"))
-    cancelled = config.LISTEN_STOP_FLAG.exists() or _preempted.is_set()
+                     settings_file=str(files.settings), owner=args.chat)
+    cancelled = files.stop.exists() or _preempted.is_set()
     stop_event.set()
-    config.LISTEN_STOP_FLAG.unlink(missing_ok=True)
-    config.LISTEN_DONE_FLAG.unlink(missing_ok=True)
+    files.stop.unlink(missing_ok=True)
+    files.done.unlink(missing_ok=True)
     if cancelled:
         on_state("")
         _emit({"text": "", "seconds": 0, "cancelled": True}, result_path)

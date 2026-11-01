@@ -24,7 +24,19 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   const machine = { uv: opts.fresh !== true, venv: opts.fresh !== true }
   // The voice server: started by the plugin from its folder, which /health then reports. One
   // already running at first says no folder, as one an earlier version started would.
-  const server = { root: '', down: false }
+  const server = { root: '', down: false, held: false, old: false }
+  // Which windows show this chat: none while you are in another chat.
+  const presence = { surfaces: ['desktop'] as ('desktop' | 'terminal')[] }
+  on('session.surfaces', () => ({ value: presence.surfaces }))
+  on('classic.PermissionRequest', () => ({}))
+  on('session.attach', (_, e) => {
+    presence.surfaces = [e.surface as 'desktop']
+    return { clientId: e.clientId }
+  })
+  on('session.detach', (_, e) => {
+    presence.surfaces = []
+    return { clientId: e.clientId }
+  })
   const fetches: Fetch[] = []
   const runs: string[][] = []
   const submitted: string[] = []
@@ -50,21 +62,25 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
       return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ version: opts.latest ?? '0.4.4' }) } }
     }
     if (server.down) return { value: { status: 503, ok: false, headers: {}, text: '{}' } }
+    if (server.old && e.url.includes('/health?')) return { value: { status: 404, ok: false, headers: {}, text: '{"error":"not found"}' } }
     let answer: Record<string, unknown> = { ok: true }
     if (e.url.endsWith('/speak')) {
       state.speaking = true
+      server.held = false
       if (state.reading) state.reading = { ...state.reading, paused: true } // a reply cuts in
     }
     if (e.url.endsWith('/stop')) {
       state.speaking = false
+      server.held = false
       state.reading = null
     }
     // The server reads a file or a selection, and keeps its place.
     if (e.url.endsWith('/read')) {
       const asked = JSON.parse(body) as { path?: string; resume?: boolean }
       if (asked.resume) {
-        if (!state.reading) return { value: { status: 409, ok: false, headers: {}, text: JSON.stringify({ ok: false, error: 'nothing to resume' }) } }
-        state.reading = { ...state.reading, paused: false }
+        if (!state.reading && !server.held) return { value: { status: 409, ok: false, headers: {}, text: JSON.stringify({ ok: false, error: 'nothing to resume' }) } }
+        if (state.reading) state.reading = { ...state.reading, paused: false }
+        server.held = false
       } else {
         const title = asked.path?.split('/').pop() ?? 'selection'
         state.reading = { title, at: 0, of: 40, paused: false }
@@ -73,10 +89,11 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
       state.speaking = true
     }
     if (e.url.endsWith('/pause')) {
+      server.held = state.speaking
       state.speaking = false
       if (state.reading) state.reading = { ...state.reading, at: 10, paused: true }
     }
-    if (e.url.endsWith('/health')) answer = { ok: true, speaking: state.speaking, reading: state.reading ?? null, ...(server.root ? { root: server.root } : {}) }
+    if (e.url.includes('/health?owner=chat-1')) answer = { ok: true, speaking: state.speaking, held: server.held, reading: state.reading ?? null, ...(server.root ? { root: server.root } : {}) }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(answer) } }
   })
   const results = new Map<string, string>()
@@ -114,7 +131,10 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     }
     if (e.argv[0] === 'sh' && (e.argv[2] ?? '').includes('astral.sh/uv/install.sh')) machine.uv = true
     if (e.argv.includes('sync')) machine.venv = true
-    if (e.argv.includes('stop-server')) server.down = true
+    if (e.argv.includes('stop-server')) {
+      server.down = true
+      server.old = false
+    }
     if (e.argv.slice(-2).join(' ') === 'claudevoice start') {
       server.down = false
       server.root = (e.argv[0] ?? '').replace(/\/\.venv\/bin\/python$/, '')
@@ -156,9 +176,11 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   })
   // The machine beneath: a venv already set up, a home folder.
   const answered = (path: string) => results.has(path) && (listener.answer === 'now' || listener.done)
+  // Who holds the one microphone: a file every chat can read.
+  const mic = { owner: '' }
   on('fs.exists', (_, e) => ({
     value: (machine.venv && e.path.endsWith('/.venv/bin/python')) || answered(e.path) || (opts.mac === true && e.path === '/usr/bin/osascript')
-      || (machine.uv && e.path === '/home/tester/.local/bin/uv'),
+      || (machine.uv && e.path === '/home/tester/.local/bin/uv') || (e.path.endsWith('/mic.owner') && mic.owner !== ''),
   }))
   // The project's files, and what is selected on screen.
   const files = new Set(['/proj/notes.md', '/proj/docs/guide.pdf', '/home/tester/my notes.md', '/proj/README.md', '/proj/docs/guide.md', '/apps/claude.app/Contents/MacOS/claude'])
@@ -169,16 +191,21 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   on('session.cwd', () => ({ value: '/proj' }))
   const selection = { text: '' }
   on('ui.selection', () => ({ value: selection.text === '' ? undefined : { text: selection.text } }))
-  on('fs.read', (_, e) => ({ value: e.path.endsWith('/.claude-plugin/plugin.json') ? JSON.stringify({ version: '0.4.4' }) : (results.get(e.path) ?? '') }))
+  on('fs.read', (_, e) => ({
+    value: e.path.endsWith('/.claude-plugin/plugin.json')
+      ? JSON.stringify({ version: '0.4.4' })
+      : e.path.endsWith('/mic.owner') ? mic.owner : (results.get(e.path) ?? ''),
+  }))
   // The desktop app names the claude it runs: its folder, with the command in MacOS/.
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/tester' : e.name === 'CLAUDE_CODE_EXECPATH' ? '/apps/claude.app/Contents/' : undefined }))
   on('fs.write', (_, e) => {
     if (e.path.endsWith('listen.done')) listener.done = true
+    if (e.path.endsWith('/mic.owner')) mic.owner = e.text
     written.push(e.path)
     writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics, toasts }
+  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics, toasts, presence, mic, server }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -449,7 +476,11 @@ test('A setting chosen for this chat only overrides the all-chats one here', asy
   await again.unmount()
 })
 
-const readBody = (w: { fetches: Fetch[] }) => JSON.parse(w.fetches.filter(f => f.url.endsWith('/read')).pop()?.body ?? '{}') as Record<string, unknown>
+/** The last /read request, without the chat it names, which every request carries. */
+const readBody = (w: { fetches: Fetch[] }) => {
+  const { owner: _owner, front: _front, ...rest } = JSON.parse(w.fetches.filter(f => f.url.endsWith('/read')).pop()?.body ?? '{}') as Record<string, unknown>
+  return rest
+}
 
 test('Read aloud reads your selection, else a file named in the prompt box, else the last reply', async ($, on) => {
   const state: { speaking: boolean; reading?: Reading } = { speaking: false }
@@ -822,4 +853,345 @@ test('A newer version on GitHub is announced once, and Update now installs it', 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.advance(10)
   expect(asked()).toBe(before)
+})
+
+// ---- each chat on its own ------------------------------------------------------------------
+
+const CLIENT = { surface: 'desktop', clientId: 'desktop-1' } as const
+const THREE_TURNS = { reason: 'answer', durationMs: 50, isAborted: false, turnId: 't1' } as const
+const said = (w: { fetches: Fetch[] }) => w.fetches.filter(f => f.url.endsWith('/speak')).map(f => (JSON.parse(f.body) as { text: string }).text)
+const muteFlag = (w: { writes: { path: string; content: string }[] }) => w.writes.filter(x => x.path.endsWith('listen.mute')).pop()?.content
+const sounded = (w: { runs: string[][] }) => w.runs.filter(argv => argv[0] === 'paplay').map(argv => (argv[1] ?? '').split('/').pop())
+
+test('A call is its own: its listener, its flags and its voice all name this chat', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  w.listener.answer = 'on-done'
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'call' })
+  const listen = w.runs.find(isListen) ?? []
+  expect(listen[listen.indexOf('--chat') + 1]).toBe('chat-1')
+  expect(listen[listen.indexOf('--heartbeat') + 1]).toContain('/chats/chat-1/listen.alive')
+  expect(w.writes.some(x => x.path.endsWith('/chats/chat-1/listen.mute'))).toBe(true)
+  expect(JSON.parse(w.fetches.find(f => f.url.endsWith('/speak'))?.body ?? '{}').owner).toBe('chat-1')
+  await ui.press({ key: 'end' })
+  // Ending it reaches only this chat: its own stop flag, and a stop that names it.
+  expect(w.written.some(p => p.endsWith('/chats/chat-1/listen.stop'))).toBe(true)
+  expect(w.written.some(p => p.endsWith('/.claudevoice/listen.stop'))).toBe(false)
+  expect(JSON.parse(w.fetches.filter(f => f.url.endsWith('/stop')).pop()?.body ?? '{}')).toEqual({ owner: 'chat-1' })
+  await ui.unmount()
+})
+
+test('In a call, leaving the chat mutes its mic and holds its voice; coming back picks up', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  w.listener.answer = 'on-done'
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'call' })
+  expect(muteFlag(w)).toBe('0')
+  expect(w.mic.owner).toBe('chat-1')
+
+  // You go to another chat while Claude is speaking: the mic mutes, the voice pauses in place.
+  await $.session.detach({ ...CLIENT, reason: 'detach' })
+  await clock.advance(10)
+  expect(muteFlag(w)).toBe('1')
+  expect(w.fetches.some(f => f.url.endsWith('/pause'))).toBe(true)
+  expect(w.mic.owner).toBe('')
+  await clock.advance(400)
+
+  // You come back: the voice carries on from there, the mic opens again.
+  await $.session.attach(CLIENT)
+  await clock.advance(10)
+  expect(readBody(w)).toEqual({ resume: true })
+  expect(muteFlag(w)).toBe('0')
+  expect(w.mic.owner).toBe('chat-1')
+  state.speaking = false
+  await clock.advance(400)
+
+  // A reply that finishes while you are away is not spoken...
+  await $.session.detach({ ...CLIENT, reason: 'detach' })
+  await clock.advance(10)
+  w.fetches.length = 0
+  await $.turn.complete({ answer: 'It is about noon.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(said(w)).toEqual([])
+
+  // ...until you come back to this chat.
+  await $.session.attach(CLIENT)
+  await clock.advance(10)
+  expect(said(w)).toEqual(['It is about noon.'])
+  await ui.press({ key: 'end' })
+  await ui.unmount()
+})
+
+test('Read aloud pauses when you leave and carries on when you return, unless you paused it', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  w.box.text = '@notes.md'
+  await ui.press({ key: 'read' })
+  await clock.advance(400)
+  await $.session.detach({ ...CLIENT, reason: 'detach' })
+  await clock.advance(400)
+  expect(state.reading?.paused).toBe(true)
+  await $.session.attach(CLIENT)
+  await clock.advance(10)
+  expect(state.reading?.paused).toBe(false)
+  expect(readBody(w)).toEqual({ resume: true })
+
+  // Paused by you: it stays paused when you come back.
+  await ui.press({ key: 'pause' })
+  await clock.advance(400)
+  w.fetches.length = 0
+  await $.session.detach({ ...CLIENT, reason: 'detach' })
+  await clock.advance(10)
+  await $.session.attach(CLIENT)
+  await clock.advance(10)
+  expect(w.fetches.some(f => f.url.endsWith('/read'))).toBe(false)
+  expect(state.reading?.paused).toBe(true)
+  await ui.unmount()
+})
+
+test('Sounds are off until switched on; then one for a ready result, another when it needs you', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  await $.turn.complete({ answer: 'All done.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual([])
+
+  // Switched on: you hear both, so you know what each means.
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  await pane.select({ key: 'sounds', value: 'on' })
+  await pane.unmount()
+  expect(sounded(w)).toEqual(['done.wav', 'attention.wav'])
+  w.runs.length = 0
+
+  // A result is ready, in this chat or another: the ready sound, and no voice.
+  await $.turn.complete({ answer: 'All done.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual(['done.wav'])
+  expect(said(w)).toEqual([])
+  w.runs.length = 0
+
+  // An aborted turn or an empty answer is no result.
+  await $.turn.complete({ answer: 'Stopped.', ...THREE_TURNS, isAborted: true })
+  await clock.advance(10)
+  await $.turn.complete({ answer: '   ', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual([])
+
+  // A permission prompt: the other sound, once, even if a second event says the same.
+  await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: {} })
+  await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: {} })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual(['attention.wav'])
+})
+
+test('In a call, a reply being spoken needs no ready sound; one held while you are away gets it', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  w.listener.answer = 'on-done'
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  await pane.select({ key: 'sounds', value: 'on' })
+  await pane.unmount()
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'call' })
+  w.runs.length = 0
+  await $.turn.complete({ answer: 'Spoken to you here.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual([])
+  expect(said(w)).toContain('Spoken to you here.')
+  state.speaking = false
+  await clock.advance(400)
+  await $.session.detach({ ...CLIENT, reason: 'detach' })
+  await clock.advance(10)
+  await $.turn.complete({ answer: 'Ready while you were away.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual(['done.wav'])
+  expect(said(w)).not.toContain('Ready while you were away.')
+  await $.session.attach(CLIENT)
+  await clock.advance(10)
+  await ui.press({ key: 'end' })
+  await ui.unmount()
+})
+
+test('A chat set to always notify reads its results and says when it needs you, wherever you are', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  await $.turn.complete({ answer: 'Off by default: this is not read.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(said(w)).toEqual([])
+
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  await pane.select({ key: 'alwaysNotify', value: 'on' })
+  await pane.unmount()
+
+  // In this chat: read as it is.
+  await $.turn.complete({ answer: 'Read to you here.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(said(w)).toEqual(['Read to you here.'])
+  state.speaking = false
+  await clock.advance(400)
+
+  // In another chat: read anyway, saying where it is from, and not at the front of the line.
+  await $.session.detach({ ...CLIENT, reason: 'detach' })
+  await clock.advance(10)
+  w.fetches.length = 0
+  await $.turn.complete({ answer: 'The build passed.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(said(w)).toEqual(['From proj. The build passed.'])
+  expect(JSON.parse(w.fetches.find(f => f.url.endsWith('/speak'))?.body ?? '{}').front).toBe(false)
+  state.speaking = false
+  await clock.advance(400)
+
+  // When it needs you.
+  w.fetches.length = 0
+  await $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: {} })
+  await clock.advance(10)
+  expect(said(w)).toEqual(['In proj, Claude needs your permission to use Bash.'])
+  state.speaking = false
+  await clock.advance(400)
+
+  // Leaving while it reads does not pause it: only moves it behind the chat you are in.
+  await $.session.attach(CLIENT)
+  await clock.advance(10)
+  await $.turn.complete({ answer: 'A long read in this chat.', ...THREE_TURNS })
+  await clock.advance(10)
+  w.fetches.length = 0
+  await $.session.detach({ ...CLIENT, reason: 'detach' })
+  await clock.advance(10)
+  expect(w.fetches.some(f => f.url.endsWith('/pause'))).toBe(false)
+  expect(JSON.parse(w.fetches.find(f => f.url.endsWith('/front'))?.body ?? '{}').front).toBe(false)
+})
+
+test('Two calls side by side: the mic stays with the one you last used, and Unmute brings it here', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  w.listener.answer = 'on-done'
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'call' })
+  state.speaking = false
+  await clock.advance(400)
+  expect(muteFlag(w)).toBe('0')
+
+  // The other chat on screen starts a call: it takes the mic, this one shows as muted.
+  w.mic.owner = 'chat-2'
+  await clock.advance(400)
+  expect(muteFlag(w)).toBe('1')
+  expect((await ui.find({ key: 'mute' }))?.text).toBe('Unmute')
+
+  await ui.press({ key: 'mute' })
+  expect(w.mic.owner).toBe('chat-1')
+  expect(muteFlag(w)).toBe('0')
+  expect((await ui.find({ key: 'mute' }))?.text).toBe('Mute')
+  await ui.press({ key: 'end' })
+  expect(w.mic.owner).toBe('')
+  await ui.unmount()
+})
+
+test('A terminal is always here', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  w.presence.surfaces = ['terminal']
+  w.listener.answer = 'on-done'
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  await ui.press({ key: 'call' })
+  w.fetches.length = 0
+  await $.turn.complete({ answer: 'Spoken as ever.', ...THREE_TURNS })
+  await clock.advance(10)
+  expect(said(w)).toEqual(['Spoken as ever.'])
+  await ui.press({ key: 'end' })
+  await ui.unmount()
+})
+
+test('A voice server from before chats had their own voice is replaced, not mistaken for none', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  w.server.old = true
+  mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'read' })
+  expect(w.runs.filter(argv => argv.includes('stop-server')).length).toBe(1)
+  expect(said(w)).toEqual(['Hello **there**, friend.'])
+  expect(w.toasts.some(text => text.includes('failed to start'))).toBe(false)
+  await ui.unmount()
+})
+
+test('A question or a plan waiting on you gets the attention sound; other tools do not', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  const clock = mock.clock(on)
+  mock.store(on)
+  on('tool.check', () => ({ decision: 'allow' as const }))
+  on('classic.Notification', () => ({}))
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  await pane.select({ key: 'sounds', value: 'on' })
+  await pane.unmount()
+  const check = (tool: string, id?: string) => $.tool.check({ tool, input: {}, ...(id ? { tool_use_id: id } : {}) } as never)
+
+  w.runs.length = 0
+  await check('Read', 'u0')
+  await check('AskUserQuestion') // a query, not a real call
+  await clock.advance(10)
+  expect(sounded(w)).toEqual([])
+  await check('AskUserQuestion', 'u1')
+  await clock.advance(10)
+  expect(sounded(w)).toEqual(['attention.wav'])
+
+  // The same wait announced by the other events is one sound, however it comes.
+  w.runs.length = 0
+  await $.classic.PermissionRequest({ tool_name: 'AskUserQuestion', tool_input: {} })
+  await $.classic.Notification({ message: 'Claude needs your attention', notification_type: 'permission_prompt' })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual([])
+
+  // Later, another kind of notification is not a wait on you; a permission one is.
+  await clock.advance(4000)
+  await $.classic.Notification({ message: 'Waiting for your input', notification_type: 'idle_prompt' })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual([])
+  await $.classic.Notification({ message: 'Claude needs your permission', notification_type: 'permission_prompt' })
+  await clock.advance(10)
+  expect(sounded(w)).toEqual(['attention.wav'])
+})
+
+test('With always notify on, a question is announced in words, not as a permission', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state)
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  await pane.select({ key: 'alwaysNotify', value: 'on' })
+  await pane.unmount()
+  await $.classic.PermissionRequest({ tool_name: 'AskUserQuestion', tool_input: {} })
+  await clock.advance(10)
+  expect(said(w)).toEqual(['Claude needs your answer to a question.'])
 })

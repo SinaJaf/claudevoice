@@ -12,6 +12,8 @@ any time. It reads your files aloud too. It all runs on your computer.
 - **Cut in.** Start talking while Claude speaks, and it stops to listen.
 - **Read files aloud.** Copy part of a markdown, text or PDF file, or name the file, and press
   **Read aloud**. Pause and pick up where you left off.
+- **Many chats, no crossed wires.** Each chat has its own call and its own voice, and speaks only
+  while you're in it. Sounds tell you when another chat is done or needs you.
 - **Private and free.** Listening and speaking run on your computer, with no extra account or API key.
 
 ## Get started
@@ -95,6 +97,27 @@ Markdown, plain text and PDF work. Headings, lists and tables are read as senten
 are announced rather than spelled out, and a PDF's page numbers, running headers and footers are
 skipped. A scanned PDF (pictures of pages) has no text to read.
 
+## Several chats at once
+
+Each chat runs on its own. Ending a call in one chat, pressing **Stop**, or a new reply never
+touches another chat.
+
+- **The mic goes to the chat you're in.** Leave a chat mid-call and its mic mutes, keeping what you
+  already said; come back and it carries on. With two calls side by side on screen, the mic stays
+  with the one you last used, and **Unmute** in the other brings it over.
+- **A chat only speaks while you're in it.** Leave mid-sentence and it pauses; come back and it
+  carries on from that sentence. A call's reply that finishes while you're away waits for you.
+- **Voices never overlap.** One sentence plays at a time, and the chat you're in goes first.
+
+Two settings in the **⚙** tell you what other chats are up to:
+
+- **Notification sounds** (off until you turn them on): one sound when a result is ready, a
+  different one when Claude needs you for a question, a plan or a permission. Turning them on plays
+  both, so you know which is which. A reply that's being read to you needs no "ready" sound.
+- **Always notify me from this chat** (set per chat): that chat reads its results aloud and says
+  when it needs you, wherever you are in the app. From elsewhere it starts with the chat's project
+  name ("From KLIZ…"), and waits its turn behind the chat you're in.
+
 ---
 
 ## Settings
@@ -105,6 +128,8 @@ Open them with the **⚙** in the footer. Every choice applies to all chats; ope
 a setting to choose a different value for the chat you're in, and **Same as all chats** to go back.
 
 - **Voice plugin**: on, or off (off leaves only the gear, to turn it back on).
+- **Notification sounds** and **Always notify me from this chat**: see
+  [Several chats at once](#several-chats-at-once).
 - **When you talk**: *Live* answers when you've finished; *Hold* waits for **Done**.
 - **Pause before Claude answers**: Short, Normal, Long, then Long ×2 up to Long ×10 for long
   thinking pauses (Long ×10 waits 5 minutes of silence). A change applies even mid-turn.
@@ -236,6 +261,11 @@ Claude Code (any surface)
   server reads it sentence by sentence, keeping its place for Pause and Resume; `clean.py` turns
   markdown into speakable text (code fences become "python code block, 12 lines", paths collapse
   to file names, `app.py:42` reads as "app.py line 42").
+- Chats stay apart in three places. A window showing a chat attaches to it, so a chat with no
+  surface (`$.session.surfaces()`, `session.attach` and `session.detach`) is one you're not in.
+  Each chat's listener talks to it through its own folder, `~/.claudevoice/chats/<id>/`. And every
+  request to the voice server names its chat: the server keeps each chat's speech and place apart
+  and plays one sentence at a time, the chat on screen first.
 - `listen.py` runs one turn and transcribes it. `live.py` is live mode: Silero VAD hears speech,
   Smart Turn (`turn.py`, its Whisper features computed in numpy) judges each pause, and talking
   while the voice server is speaking stops it. `record.py` follows the system's input device.
@@ -264,6 +294,7 @@ Claude Code (any surface)
 ```bash
 claude plugin validate .      # manifest + hooks module
 claude plugin test .          # tests/panel.test.tsx against the engine
+.venv/bin/python -m unittest tests.test_speaker   # the voice server's speech, with no sound
 ```
 
 Edits reach a running session with `/reload-plugins` when the plugin was installed from this folder
@@ -294,7 +325,8 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 
 ## License
 
-MIT. The models it downloads keep their own licenses: Kokoro-82M (Apache-2.0, hexgrad),
+MIT, the notification sounds included (`scripts/make_sounds.py` generates them). The models it
+downloads keep their own licenses: Kokoro-82M (Apache-2.0, hexgrad),
 Parakeet TDT 0.6B v2 and v3 (CC-BY-4.0, NVIDIA; ONNX export by istupakov, run with onnx-asr),
 Smart Turn v3.2 (BSD-2-Clause, Daily / Pipecat) and Silero VAD (MIT, Silero Team). PDFs are read
 with pypdfium2 (Apache-2.0 or BSD-3-Clause) and PDFium (BSD-3-Clause).

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("CLAUDEVOICE_HOME", Path.home() / ".claudevoice"))
@@ -13,12 +14,23 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 ENABLED_FLAG = CONFIG_DIR / "enabled"
 LOG_PATH = CONFIG_DIR / "claudevoice.log"
 SERVER_LOG_PATH = CONFIG_DIR / "server.log"
-# The voice panel touches this file to cut a recording short.
-LISTEN_STOP_FLAG = CONFIG_DIR / "listen.stop"
-# ...and this one to finish a hold-mode recording and transcribe it.
-LISTEN_DONE_FLAG = CONFIG_DIR / "listen.done"
-LISTEN_MUTE_FLAG = CONFIG_DIR / "listen.mute"  # "1" while the mic is muted
-LISTEN_LOCK = CONFIG_DIR / "listen.lock"  # only one microphone recording at a time
+CHATS_DIR = CONFIG_DIR / "chats"
+
+
+class ListenFiles:
+    """The files one chat's listener and its plugin talk through. Each chat has its own, so
+    ending a call or pressing Done in one chat never reaches another."""
+
+    def __init__(self, chat: str = "") -> None:
+        name = re.sub(r"[^A-Za-z0-9_-]", "", chat)
+        self.dir = CHATS_DIR / name if name else CONFIG_DIR
+        self.stop = self.dir / "listen.stop"  # the plugin touches this to cut a recording short
+        self.done = self.dir / "listen.done"  # ...and this to finish one and transcribe it
+        self.mute = self.dir / "listen.mute"  # "1" while the mic is muted, or you are in another chat
+        self.lock = self.dir / "listen.lock"  # one recording at a time, in a chat
+        self.pid = self.dir / "listen.pid"
+        self.state = self.dir / "listen.state"
+        self.settings = self.dir / "listen.settings"
 
 # Windows process flags (subprocess has them only on Windows).
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
