@@ -327,7 +327,7 @@ wheels = [
 
 [[package]]
 name = "claudevoice"
-version = "0.7.0"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "en-core-web-sm" },
@@ -353,6 +353,9 @@ qwen = [
     { name = "realtimetts-qwen-native", extra = ["cuda12"], marker = "(platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'x86_64' and sys_platform == 'win32')" },
     { name = "requests", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
 ]
+qwen-light = [
+    { name = "qwentts-cpp-python", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+]
 whisper = [
     { name = "faster-whisper", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -371,6 +374,7 @@ requires-dist = [
     { name = "onnxruntime", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = "<1.24" },
     { name = "preshed", specifier = ">=3.0.15" },
     { name = "pypdfium2", specifier = ">=4.30" },
+    { name = "qwentts-cpp-python", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'qwen-light'", specifier = "==0.5.0" },
     { name = "realtimetts-qwen-native", extras = ["cuda12"], marker = "(platform_machine == 'AMD64' and sys_platform == 'linux' and extra == 'qwen') or (platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'qwen') or (platform_machine == 'AMD64' and sys_platform == 'win32' and extra == 'qwen') or (platform_machine == 'x86_64' and sys_platform == 'win32' and extra == 'qwen')", specifier = "==0.2.0" },
     { name = "requests", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'qwen'", specifier = ">=2.31" },
     { name = "sounddevice", specifier = ">=0.5.6" },
@@ -379,7 +383,7 @@ requires-dist = [
     { name = "torch", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = "==2.2.2" },
     { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.2", index = "https://download.pytorch.org/whl/cpu" },
 ]
-provides-extras = ["whisper", "qwen"]
+provides-extras = ["whisper", "qwen", "qwen-light"]
 
 [[package]]
 name = "click"
@@ -1869,6 +1873,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/74/93/7baea19427dcfbe1e5a372d81473250b379f04b1bd3c4c5ff825e2327202/pyyaml-6.0.3-cp312-cp312-win32.whl", hash = "sha256:96b533f0e99f6579b3d4d4995707cf36df9100d67e0c8303a0c55b27b5f99bc5", size = 137658, upload-time = "2025-09-25T21:32:20.209Z" },
     { url = "https://files.pythonhosted.org/packages/86/bf/899e81e4cce32febab4fb42bb97dcdf66bc135272882d1987881a4b519e9/pyyaml-6.0.3-cp312-cp312-win_amd64.whl", hash = "sha256:5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b", size = 154003, upload-time = "2025-09-25T21:32:21.167Z" },
     { url = "https://files.pythonhosted.org/packages/1a/08/67bd04656199bbb51dbed1439b7f27601dfb576fb864099c7ef0c3e55531/pyyaml-6.0.3-cp312-cp312-win_arm64.whl", hash = "sha256:64386e5e707d03a7e172c0701abfb7e10f0fb753ee1d773128192742712a98fd", size = 140344, upload-time = "2025-09-25T21:32:22.617Z" },
+]
+
+[[package]]
+name = "qwentts-cpp-python"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/96/37/8ba17242cfc7434687f35e9089a44fd1392efd3121952fb6d659f0b38dd8/qwentts_cpp_python-0.5.0-py3-none-macosx_14_0_arm64.whl", hash = "sha256:04546453b573afc5f0fbc8ba3c8fc810fef6367c4b603b9b5a1ef0dd459ed1a9", size = 1259944, upload-time = "2026-09-30T22:01:32.98Z" },
 ]
 
 [[package]]

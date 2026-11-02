@@ -139,6 +139,42 @@ class SpeakerTest(unittest.TestCase):
         time.sleep(0.15)
         self.assertEqual(len(self.speaker.made), made)
 
+    def test_each_qwen_engine_loads_when_used_and_rests_on_its_own(self) -> None:
+        loaded, closed = [], []
+
+        class Voice:
+            def __init__(self, engine):
+                self.engine = engine
+                loaded.append(engine)
+
+            def stream(self, text, speaker):
+                yield np.ones(tts_server.BLOCK, dtype=np.float32) * 0.5
+
+            def close(self):
+                closed.append(self.engine)
+
+        speaker = tts_server.Speaker(config.load())
+        original = tts_server.qwen.load
+        tts_server.qwen.load = Voice
+        try:
+            list(tts_server.Speaker._generate(speaker, "Hello there.", "qwen:Aiden", 1.0))
+            list(tts_server.Speaker._generate(speaker, "Hello there.", "qwen:Aiden", 1.0))
+            self.assertEqual(loaded, ["qwen"], "loaded once, and the other not at all")
+            list(tts_server.Speaker._generate(speaker, "Hello there.", "qwen_light:Ryan", 1.0))
+            self.assertEqual(loaded, ["qwen", "qwen_light"])
+            speaker._qwen_used["qwen"] = 0.0
+            speaker._rest_qwen()
+            self.assertEqual(closed, ["qwen"], "the other one was used just now")
+            self.assertEqual(list(speaker._qwen), ["qwen_light"])
+        finally:
+            tts_server.qwen.load = original
+
+    def test_both_qwen_engines_read_in_passages_at_their_own_pace(self) -> None:
+        speaker = tts_server.Speaker(config.load())
+        for engine in tts_server.qwen.ENGINES:
+            self.assertEqual(speaker._pace(engine, 1.25), 1.0)
+        self.assertEqual(speaker._pace("kokoro", 1.25), 1.25)
+
     def test_a_voice_that_cannot_start_says_so_once_and_kokoro_reads_on(self) -> None:
         said: list[str] = []
 

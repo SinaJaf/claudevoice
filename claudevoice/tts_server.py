@@ -120,8 +120,8 @@ class Speaker:
         self._wake = threading.Event()
         self._lock = threading.Lock()
         self.pipeline = None
-        self._qwen = None
-        self._qwen_used = 0.0
+        self._qwen: dict[str, object] = {}  # by engine: loaded when used, each rests on its own
+        self._qwen_used: dict[str, float] = {}
         self.last_error = ""
         self.output_device = ""
         self._stream = None
@@ -180,7 +180,7 @@ class Speaker:
         # Kokoro goes sentence by sentence; a cloud engine takes the whole text at once.
         if engine == "kokoro":
             chunks = split_sentences(text)
-        elif engine == "qwen":
+        elif engine in qwen.ENGINES:
             chunks = group(split_long(split_sentences(text)), QWEN_PIECE)
         else:
             chunks = [text.strip()] if text.strip() else []
@@ -209,7 +209,7 @@ class Speaker:
         speed = self._pace(engine, speed)
         pieces = split_long(split_sentences(text))
         if engine != "kokoro":
-            pieces = group(pieces, QWEN_PIECE if engine == "qwen" else CLOUD_PIECE)
+            pieces = group(pieces, QWEN_PIECE if engine in qwen.ENGINES else CLOUD_PIECE)
         if not pieces:
             return 0
         log.info("read %s: %d chars in %d pieces as %s:%s", title, len(text), len(pieces), engine, voice)
@@ -257,7 +257,7 @@ class Speaker:
 
     def _pace(self, engine: str, speed: float | None) -> float:
         """Qwen3-TTS has no speed control, so its pauses stay at their full length too."""
-        return 1.0 if engine == "qwen" else float(speed or self.cfg["speed"])
+        return 1.0 if engine in qwen.ENGINES else float(speed or self.cfg["speed"])
 
     def _stir(self) -> None:
         self._wake.set()
@@ -335,8 +335,8 @@ class Speaker:
             yield self._cloud_openai(text, voice, speed)
         elif engine == "elevenlabs":
             yield self._cloud_elevenlabs(text, voice)
-        elif engine == "qwen":
-            yield from pacing.trim_stream(self._qwen_stream(text, voice))
+        elif engine in qwen.ENGINES:
+            yield from pacing.trim_stream(self._qwen_stream(engine, text, voice))
         else:
             gap = 0.0
             for result in self.pipeline(text, voice=voice, speed=speed):
@@ -347,25 +347,25 @@ class Speaker:
                 yield pacing.pace(result.audio.detach().cpu().numpy().astype(np.float32), result.tokens, speed)
                 gap = pacing.pause_after(result.graphemes, speed)
 
-    def _qwen_stream(self, text: str, voice: str):
-        if self._qwen is None:
+    def _qwen_stream(self, engine: str, text: str, voice: str):
+        model = self._qwen.get(engine)
+        if model is None:
             t0 = time.time()
-            self._qwen = qwen.load()  # heavy, and only for this voice
-            log.info("Qwen3-TTS ready in %.1fs", time.time() - t0)
+            model = self._qwen[engine] = qwen.load(engine)  # heavy, and only for this voice
+            log.info("Qwen3-TTS (%s) ready in %.1fs", engine, time.time() - t0)
         t0, made = time.time(), 0
-        for audio in self._qwen.stream(text.strip(), qwen.speaker_for(voice)):
-            self._qwen_used = time.time()
+        for audio in model.stream(text.strip(), qwen.speaker_for(voice)):
+            self._qwen_used[engine] = time.time()
             made += len(audio)
             yield audio
         # Whether it keeps up on this computer, for anyone reading the log; no text is written.
-        log.info("Qwen3-TTS made %.1fs of speech in %.1fs", made / SAMPLE_RATE, time.time() - t0)
+        log.info("Qwen3-TTS (%s) made %.1fs of speech in %.1fs", engine, made / SAMPLE_RATE, time.time() - t0)
 
     def _rest_qwen(self) -> None:
-        if self._qwen is None or time.time() - self._qwen_used < QWEN_REST:
-            return
-        self._qwen.close()
-        self._qwen = None
-        log.info("Qwen3-TTS gave back its memory")
+        for engine in list(self._qwen):
+            if time.time() - self._qwen_used.get(engine, 0.0) >= QWEN_REST:
+                self._qwen.pop(engine).close()
+                log.info("Qwen3-TTS (%s) gave back its memory", engine)
 
     def _key(self, env_name: str) -> str:
         key = os.environ.get(env_name, "") or _login_shell_var(env_name)
@@ -563,7 +563,7 @@ class Speaker:
         if engine == "kokoro":
             return
         reason = "it needs an API key" if "environment variable" in self.last_error else "it could not start"
-        name = "Qwen" if engine == "qwen" else engine
+        name = "Qwen" if engine in qwen.ENGINES else engine
         notice = f"The {name} voice is not available, {reason}. Using Kokoro instead."
         try:
             for text in ([chunk] if reading.warned else [notice, chunk]):

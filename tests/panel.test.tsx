@@ -19,7 +19,7 @@ const WAVE = /[▁▃▅▇]/
 type Reading = { title: string; at: number; of: number; paused: boolean } | null
 
 /** The world beneath the mod: a running Kokoro server, a session with one reply. */
-function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { mac?: boolean; fresh?: boolean; latest?: string } = {}) {
+function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { mac?: boolean; fresh?: boolean; latest?: string; nvidia?: boolean } = {}) {
   // A fresh machine: no uv and no venv until the plugin installs them.
   const machine = { uv: opts.fresh !== true, venv: opts.fresh !== true }
   // The voice server: started by the plugin from its folder, which /health then reports. One
@@ -147,7 +147,10 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     const isListen = e.argv.includes('claudevoice.listen') && !e.argv.includes('--warm')
     const isConfigRead = e.argv.includes('config') && e.argv.length === 4
     const isQwenCheck = e.argv.includes('qwen-check')
-    const stdout = isQwenCheck ? JSON.stringify(opts.mac === false ? { can: false, why: 'it needs a newer card' } : { can: true, why: '' }) : e.argv.includes('--devices')
+    const qwenFound = opts.mac === false
+      ? (opts.nvidia === true ? { can: true, why: '', light: false } : { can: false, why: 'it needs a newer card', light: false })
+      : { can: true, why: '', light: true }
+    const stdout = isQwenCheck ? JSON.stringify(qwenFound) : e.argv.includes('--devices')
       ? JSON.stringify(mics.list)
       : isListen
         ? JSON.stringify({ text: 'what time is it', seconds: 2.1 })
@@ -1233,5 +1236,46 @@ test('Qwen3-TTS is offered only where it can run, and says why not', async ($, o
   expect(options.some(o => o.value.startsWith('kokoro:'))).toBe(true)
   expect(options.some(o => o.value.startsWith('qwen:'))).toBe(false)
   expect(await pane.find({ type: 'Text', text: /it needs a newer card/ })).toBeDefined()
+  await pane.unmount()
+})
+
+test('On a Mac the lighter engine is a choice of its own, with its own install', async ($, on) => {
+  const w = world(on, { speaking: false }, { mac: true })
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'settings' })
+  await clock.advance(10)
+  await ui.unmount()
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  const options = (await pane.find({ type: 'Select', key: 'speaking' }))?.props.options as { value: string }[]
+  expect(options.some(o => o.value === 'qwen:Aiden')).toBe(true)
+  expect(options.some(o => o.value === 'qwen_light:Aiden')).toBe(true)
+  await pane.select({ key: 'speaking', value: 'qwen_light:Aiden' })
+  await clock.advance(10)
+  const install = w.runs.findIndex(argv => argv.includes('sync') && argv.includes('qwen-light'))
+  const fetch = w.runs.findIndex(argv => argv.includes('fetch-voice') && argv.includes('light'))
+  const saved = w.runs.findIndex(argv => argv.includes('config') && argv.includes('tts_engine') && argv.includes('qwen_light'))
+  expect(install).toBeGreaterThan(-1)
+  expect(fetch).toBeGreaterThan(install)
+  expect(saved).toBeGreaterThan(fetch)
+  expect(w.runs.some(argv => argv.includes('sync') && argv.includes('qwen'))).toBe(false)
+  await pane.unmount()
+})
+
+test('With an NVIDIA card there is one Qwen3-TTS engine to choose', async ($, on) => {
+  world(on, { speaking: false }, { mac: false, nvidia: true })
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'settings' })
+  await clock.advance(10)
+  await ui.unmount()
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  const options = (await pane.find({ type: 'Select', key: 'speaking' }))?.props.options as { value: string }[]
+  expect(options.some(o => o.value === 'qwen:Aiden')).toBe(true)
+  expect(options.some(o => o.value.startsWith('qwen_light:'))).toBe(false)
   await pane.unmount()
 })

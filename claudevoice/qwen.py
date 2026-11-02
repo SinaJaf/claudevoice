@@ -1,7 +1,8 @@
 """Qwen3-TTS, on the engine this computer runs it with.
 
-Apple Silicon uses MLX. Windows and Linux with a recent NVIDIA card use qwentts.cpp, whose
-ready-made packages need no compiler and no PyTorch. A processor alone is too slow to read
+Apple Silicon uses MLX, or, as a lighter choice, qwentts.cpp on Metal: the same voice in about
+half the memory, a little more slowly. Windows and Linux with a recent NVIDIA card use qwentts.cpp,
+whose ready-made packages need no compiler and no PyTorch. A processor alone is too slow to read
 without stopping, so other computers are not offered this voice.
 """
 from __future__ import annotations
@@ -25,6 +26,9 @@ NATIVE_CHUNK = 0.64  # the setting the package's maintainer validates streaming 
 
 log = logging.getLogger("claudevoice.server")
 
+STANDARD, LIGHT = "qwen", "qwen_light"  # the names in the settings
+ENGINES = (STANDARD, LIGHT)
+MIN_MACOS_LIGHT = 14  # the oldest macOS the qwentts.cpp Metal package is built for
 VOICES = ("Aiden", "Ryan")
 SAMPLE_RATE = 24_000
 ENGINE_WARNING = 2  # qwentts.cpp log levels: 0 and 1 are every step of every sentence
@@ -37,8 +41,22 @@ def uses_mlx() -> bool:
     return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
+def _macos_major() -> int:
+    try:
+        return int(platform.mac_ver()[0].split(".")[0])
+    except ValueError:
+        return 0
+
+
 def check() -> dict:
-    """Can this computer run the voice, and if not, why not (for the settings pane)."""
+    """Can this computer run the voice, and if not, why not (for the settings pane);
+    `light`: it can also run the lighter engine."""
+    found = _check()
+    found["light"] = uses_mlx() and _macos_major() >= MIN_MACOS_LIGHT
+    return found
+
+
+def _check() -> dict:
     if uses_mlx():
         return {"can": True, "why": "", "gpu": "Apple Silicon"}
     if sys.platform == "darwin":
@@ -79,10 +97,14 @@ def _card(line: str) -> tuple[str, float, float, int] | None:
         return None
 
 
-def fetch() -> None:
+def _uses_mlx_for(engine: str) -> bool:
+    return engine != LIGHT and uses_mlx()
+
+
+def fetch(engine: str = STANDARD) -> None:
     """Download the voice. Fetching only what this engine uses matters: the qwentts.cpp
     repository holds every size of every model, about 18 GB."""
-    if uses_mlx():
+    if _uses_mlx_for(engine):
         from huggingface_hub import snapshot_download
 
         snapshot_download(MLX_MODEL)
@@ -138,8 +160,8 @@ class _NativeVoice:
         self.model.close()
 
 
-def load() -> _MlxVoice | _NativeVoice:
-    return _MlxVoice() if uses_mlx() else _NativeVoice()
+def load(engine: str = STANDARD) -> _MlxVoice | _NativeVoice:
+    return _MlxVoice() if _uses_mlx_for(engine) else _NativeVoice()
 
 
 def speaker_for(voice: str) -> str:

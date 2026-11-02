@@ -78,7 +78,7 @@ DEFAULTS: dict = {
     "stt_model": "gpt-4o-mini-transcribe",
     "stt_base_url": "https://api.openai.com/v1",
     "stt_api_key_env": "OPENAI_API_KEY",
-    # Speaking (text-to-speech). "kokoro" and "qwen" are local; "openai" and "elevenlabs" are cloud.
+    # Speaking (text-to-speech). "kokoro", "qwen" and "qwen_light" are local; "openai" and "elevenlabs" are cloud.
     # Cloud keys are read from the environment variable named here, never stored in this file.
     "tts_engine": "kokoro",
     "tts_voice": "nova",

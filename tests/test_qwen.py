@@ -45,12 +45,19 @@ class Check(unittest.TestCase):
     def test_apple_silicon_can(self) -> None:
         self.assertTrue(self.computer("darwin", "arm64")["can"])
 
+    def test_the_lighter_engine_needs_macos_14(self) -> None:
+        for version, expected in (("27.0.1", True), ("14.0", True), ("13.6", False), ("", False)):
+            with mock.patch.object(qwen.platform, "mac_ver", lambda v=version: (v, ("", "", ""), "")):
+                found = self.computer("darwin", "arm64")
+            self.assertEqual(found["light"], expected, version)
+            self.assertTrue(found["can"], "the standard engine does not depend on it")
+
     def test_an_intel_mac_cannot(self) -> None:
         self.assertFalse(self.computer("darwin", "x86_64")["can"])
 
     def test_a_recent_nvidia_card_can(self) -> None:
         found = self.computer(stdout="NVIDIA GeForce RTX 4060 Laptop GPU, 8188, 8.9, 561.09\n")
-        self.assertEqual(found, {"can": True, "why": "", "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU"})
+        self.assertEqual(found, {"can": True, "why": "", "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU", "light": False})
         self.assertTrue(self.computer("linux", "x86_64", stdout="NVIDIA GeForce RTX 3060, 12288, 8.6, 550.54\n")["can"])
 
     def test_a_card_too_old(self) -> None:
@@ -146,6 +153,40 @@ class NativeVoice(unittest.TestCase):
     def test_fetching_takes_only_the_files_this_engine_uses(self) -> None:
         qwen.fetch()
         self.assertEqual(self.calls["fetched"], ("Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", "Q8_0"))
+
+
+class EngineChoice(unittest.TestCase):
+    def setUp(self) -> None:
+        self.calls: list[str] = []
+        calls = self.calls
+
+        class QwenTTS:
+            @classmethod
+            def from_pretrained(cls, model, **options):
+                calls.append("native loaded")
+                return cls()
+
+            def set_log_callback(self, callback):
+                pass
+
+        package = types.ModuleType("qwentts_cpp")
+        package.QwenTTS = QwenTTS
+        package.resolve_gguf_paths = lambda model, quant: calls.append("native fetched")
+        for p in [mock.patch.dict(sys.modules, {"qwentts_cpp": package}), *on("darwin", "arm64"),
+                  mock.patch.object(qwen, "_MlxVoice", lambda: calls.append("mlx loaded"))]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_mac_loads_the_engine_chosen(self) -> None:
+        qwen.load(qwen.STANDARD)
+        self.assertEqual(self.calls, ["mlx loaded"])
+        self.calls.clear()
+        qwen.load(qwen.LIGHT)
+        self.assertEqual(self.calls, ["native loaded"])
+
+    def test_the_lighter_engine_fetches_its_own_files(self) -> None:
+        qwen.fetch(qwen.LIGHT)
+        self.assertEqual(self.calls, ["native fetched"])
 
 
 class Speakers(unittest.TestCase):

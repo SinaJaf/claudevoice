@@ -144,7 +144,8 @@ let synced = false
 async function chosenExtras($: Engine): Promise<string[]> {
   try {
     const config = JSON.parse(await $.fs.read(await flagPath($, 'config.json'))) as { tts_engine?: string }
-    return config.tts_engine === 'qwen' ? ['--extra', 'qwen'] : []
+    if (config.tts_engine === 'qwen') return ['--extra', 'qwen']
+    return config.tts_engine === 'qwen_light' ? ['--extra', 'qwen-light'] : []
   } catch {
     return []
   }
@@ -343,7 +344,7 @@ async function setChatSetting($: Engine, key: keyof ChatSettings, value: string)
   if (key === 'patience' || key === 'talkOver') await shareLiveSettings($)
   if (key === 'sounds' && value === 'on') void sampleSounds($)
   if (key === 'listening' && value.startsWith('local:')) await ensureWhisper($)
-  if (key === 'speaking' && value.startsWith('qwen:')) await ensureQwen($)
+  if (key === 'speaking' && value.startsWith('qwen')) await ensureQwen($, value.split(':', 1)[0] ?? '')
 }
 
 async function modeHere($: Engine): Promise<ListenMode> {
@@ -1172,12 +1173,14 @@ async function loadSettings($: Engine): Promise<VoiceSettings> {
   flat._platform = platform.stdout.trim()
   const qwen = await $.process.run([...py, '-m', 'claudevoice', 'qwen-check'], { cwd: root($), timeoutMs: 60000 })
   try {
-    const found = JSON.parse(qwen.stdout) as { can?: boolean; why?: string }
+    const found = JSON.parse(qwen.stdout) as { can?: boolean; why?: string; light?: boolean }
     flat._qwen = found.can === true ? 'yes' : ''
     flat._qwenWhy = found.why ?? ''
+    flat._qwenLight = found.light === true ? 'yes' : ''
   } catch {
     flat._qwen = ''
     flat._qwenWhy = ''
+    flat._qwenLight = ''
   }
   await update($, settings, () => flat)
   return flat
@@ -1218,18 +1221,19 @@ async function ensureWhisper($: Engine): Promise<boolean> {
 }
 
 /** Qwen3-TTS is an optional voice too, and a large one: install it, then fetch the model, with word of both. */
-async function ensureQwen($: Engine): Promise<boolean> {
+async function ensureQwen($: Engine, engine: string): Promise<boolean> {
   const r = root($)
+  const light = engine === 'qwen_light'
   await update($, note, () => 'installing Qwen3-TTS (a few minutes the first time)…')
-  $.ui.toast('Installing Qwen3-TTS: 2 to 2.5 GB to download, once. It speaks when it is ready.')
+  $.ui.toast(`Installing Qwen3-TTS: ${light ? 'about 1.3 GB' : '2 to 2.5 GB'} to download, once. It speaks when it is ready.`)
   // A run is cut off after ten minutes; on a slow connection a download picks up where it stopped.
   const patiently = async (argv: string[]) => {
     let ran = await $.process.run(argv, { cwd: r, timeoutMs: 600000 })
     for (let tries = 1; ran.exitCode !== 0 && tries < 4; tries++) ran = await $.process.run(argv, { cwd: r, timeoutMs: 600000 })
     return ran
   }
-  let last = await patiently([await uv($), 'sync', '--project', r, '--quiet', '--inexact', '--extra', 'qwen'])
-  if (last.exitCode === 0) last = await patiently([...(await python($)), '-m', 'claudevoice', 'fetch-voice'])
+  let last = await patiently([await uv($), 'sync', '--project', r, '--quiet', '--inexact', '--extra', light ? 'qwen-light' : 'qwen'])
+  if (last.exitCode === 0) last = await patiently([...(await python($)), '-m', 'claudevoice', 'fetch-voice', ...(light ? ['light'] : [])])
   await update($, note, () => '')
   if (last.exitCode !== 0) {
     $.ui.toast(`Qwen3-TTS could not be installed: ${last.stderr.trim().split('\n').pop() ?? ''}`)
@@ -1253,7 +1257,7 @@ function speakingValue(s: VoiceSettings): string {
 }
 async function pickSpeaking($: Engine, value: string): Promise<void> {
   const [engine, voice] = value.split(':', 2) as [string, string]
-  if (engine === 'qwen' && !(await ensureQwen($))) return
+  if (engine.startsWith('qwen') && !(await ensureQwen($, engine))) return
   await setSetting($, 'tts_engine', engine)
   if (engine === 'kokoro') await setSetting($, 'voice', voice)
   else if (voice !== '') await setSetting($, 'tts_voice', voice)
@@ -1474,6 +1478,7 @@ async function settingsPane($: Engine, e: Surface) {
   const speaking: Option[] = [
     ...KOKORO_VOICES.map(([v, label]) => ({ value: `kokoro:${v}`, label: `Local Kokoro: ${label}` })),
     ...(canQwen ? QWEN_VOICES.map(([v, label]) => ({ value: `qwen:${v}`, label: `Local Qwen3-TTS, expressive: ${label}` })) : []),
+    ...(s._qwenLight === 'yes' ? QWEN_VOICES.map(([v, label]) => ({ value: `qwen_light:${v}`, label: `Local Qwen3-TTS, lighter on memory: ${label}` })) : []),
     ...OPENAI_VOICES.map(v => ({ value: `openai:${v}`, label: `Cloud OpenAI: ${v}` })),
     { value: 'elevenlabs:', label: `Cloud ElevenLabs: voice ${s.tts_voice ?? ''}` },
   ]
@@ -1603,7 +1608,7 @@ async function settingsPane($: Engine, e: Surface) {
         {row('microphone', 'Microphone', microphones, s.input_device ?? '', (v: string) => void setSetting($, 'input_device', v))}
         {row('speaking', 'Speaking (text to speech)', speaking, speakingValue(s), (v: string) => void pickSpeaking($, v))}
         {!canQwen && (s._qwenWhy ?? '') !== '' && <Text dimColor>The more natural Qwen3-TTS voice is not offered here: {s._qwenWhy}.</Text>}
-        {row('speed', speakingValue(s).startsWith('qwen:') ? 'Speed (Qwen3-TTS keeps its own pace)' : 'Speed', speeds, String(Number(s.speed ?? '1.05')), (v: string) => void setSetting($, 'speed', v))}
+        {row('speed', speakingValue(s).startsWith('qwen') ? 'Speed (Qwen3-TTS keeps its own pace)' : 'Speed', speeds, String(Number(s.speed ?? '1.05')), (v: string) => void setSetting($, 'speed', v))}
       </Box>
       <Box marginTop={1}>
         <Text dimColor>Parakeet runs on this computer and downloads about 650 MB once. Cloud engines read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>
