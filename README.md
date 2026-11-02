@@ -108,7 +108,7 @@ reading; see [Voices](#voices).
 Choose a voice under **Speaking** in the ⚙ settings.
 
 - **Kokoro** is the default. It runs on any computer and is light on memory and quick to make speech, but its tone is flat: a question mark or an exclamation mark barely changes how it sounds.
-- **Qwen3-TTS** is more natural, with stops that follow the punctuation. It's for Apple Silicon Macs for now, and it's heavy: about 2.5 GB to download the first time you pick it and about 7 GB of memory while it's in use (it gives the memory back after five minutes unused, then takes a few seconds to load again). Its two English voices, Aiden and Ryan, are both male, and **Speed** doesn't change its pace. It reads a few sentences at a time, so after **Pause**, **Resume** goes back to the start of that passage, up to about 20 seconds.
+- **Qwen3-TTS** is more natural, with stops that follow the punctuation. It's offered on Apple Silicon Macs, and on Windows and Linux with an NVIDIA card from 2018 or later (GTX 16 or RTX series, 4 GB of graphics memory). Other computers aren't offered it, because a processor alone is too slow to read without stopping. It's heavy: 2 to 2.5 GB to download the first time you pick it, and about 7 GB of memory on a Mac while it's in use (it gives the memory back after five minutes unused, then takes a few seconds to load again). Its two English voices, Aiden and Ryan, are both male, and **Speed** doesn't change its pace. It reads a few sentences at a time, so after **Pause**, **Resume** goes back to the start of that passage, up to about 20 seconds.
 - **OpenAI and ElevenLabs** are cloud voices. They need an API key, cost money and send your text online.
 
 ## Several chats at once
@@ -277,7 +277,7 @@ Claude Code (any surface)
   to file names, `app.py:42` reads as "app.py line 42"). `pacing.py` adds pauses for Kokoro, which
   leaves few at punctuation but says when each word falls. Speech is made a few pieces ahead of
   what is playing, by a thread of its own, so a stop between sentences isn't also the time it took
-  to make the next one. Qwen3-TTS (mlx-audio) streams, so it starts within about half a second.
+  to make the next one. Qwen3-TTS (`qwen.py`: mlx-audio on a Mac, qwentts.cpp with CUDA elsewhere) streams, so it starts sounding quickly.
 - Chats stay apart in three places. A window showing a chat attaches to it, so a chat with no
   surface (`$.session.surfaces()`, `session.attach` and `session.detach`) is one you're not in.
   Each chat's listener talks to it through its own folder, `~/.claudevoice/chats/<id>/`. And every
@@ -344,7 +344,8 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 
 MIT, the notification sounds included (`scripts/make_sounds.py` generates them). The models it
 downloads keep their own licenses: Kokoro-82M (Apache-2.0, hexgrad), Qwen3-TTS (Apache-2.0, Alibaba
-Qwen; MLX conversion by mlx-community, run with mlx-audio),
+Qwen; MLX conversion by mlx-community, run with mlx-audio; GGUF conversion by Serveurperso, run with
+qwentts.cpp through realtimetts-qwen-native, both MIT),
 Parakeet TDT 0.6B v2 and v3 (CC-BY-4.0, NVIDIA; ONNX export by istupakov, run with onnx-asr),
 Smart Turn v3.2 (BSD-2-Clause, Daily / Pipecat) and Silero VAD (MIT, Silero Team). PDFs are read
 with pypdfium2 (Apache-2.0 or BSD-3-Clause) and PDFium (BSD-3-Clause).

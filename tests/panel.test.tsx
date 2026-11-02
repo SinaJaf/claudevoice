@@ -146,8 +146,8 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     }
     const isListen = e.argv.includes('claudevoice.listen') && !e.argv.includes('--warm')
     const isConfigRead = e.argv.includes('config') && e.argv.length === 4
-    const isPlatformRead = e.argv.some(a => a.includes('platform.machine'))
-    const stdout = isPlatformRead ? (opts.mac === false ? 'win32 AMD64' : 'darwin arm64') : e.argv.includes('--devices')
+    const isQwenCheck = e.argv.includes('qwen-check')
+    const stdout = isQwenCheck ? JSON.stringify(opts.mac === false ? { can: false, why: 'it needs a newer card' } : { can: true, why: '' }) : e.argv.includes('--devices')
       ? JSON.stringify(mics.list)
       : isListen
         ? JSON.stringify({ text: 'what time is it', seconds: 2.1 })
@@ -1218,7 +1218,7 @@ test('Picking Qwen3-TTS installs it and fetches the voice before switching to it
   await pane.unmount()
 })
 
-test('Qwen3-TTS is offered only on Apple Silicon', async ($, on) => {
+test('Qwen3-TTS is offered only where it can run, and says why not', async ($, on) => {
   world(on, { speaking: false }, { mac: false })
   const clock = mock.clock(on)
   mock.store(on)
@@ -1232,5 +1232,6 @@ test('Qwen3-TTS is offered only on Apple Silicon', async ($, on) => {
   const options = (await pane.find({ type: 'Select', key: 'speaking' }))?.props.options as { value: string }[]
   expect(options.some(o => o.value.startsWith('kokoro:'))).toBe(true)
   expect(options.some(o => o.value.startsWith('qwen:'))).toBe(false)
+  expect(await pane.find({ type: 'Text', text: /it needs a newer card/ })).toBeDefined()
   await pane.unmount()
 })

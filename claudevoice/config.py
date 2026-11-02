@@ -49,8 +49,10 @@ def background() -> dict:
         return {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
     return {"start_new_session": True}
 
-# The expressive local voice: Qwen3-TTS's smallest version with built-in voices, for Apple Silicon.
-QWEN_MODEL = "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"
+def no_window() -> dict:
+    """subprocess options for a short command that should not flash a console on Windows."""
+    return {"creationflags": _CREATE_NO_WINDOW} if os.name == "nt" else {}
+
 
 DEFAULTS: dict = {
     # Kokoro voice. Blend voices by listing several, e.g. "af_heart,af_bella".

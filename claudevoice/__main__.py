@@ -13,7 +13,8 @@ USAGE = """claudevoice <command>
   on | off | status              always-on mode: every Claude Code reply is read aloud
   start                          make sure the voice server is running (no always-on)
   stop-server                    stop the voice server (it restarts on the next use)
-  fetch-voice                    download the Qwen3-TTS voice (about 2 GB, once)
+  fetch-voice                    download the Qwen3-TTS voice (1 to 2 GB, once)
+  qwen-check                     can this computer run Qwen3-TTS, and why not if not
   say "text" [--voice V]         speak text through the server (starts it if needed)
   stop                           cut off whatever is playing
   voices                         list the English Kokoro voices
@@ -44,10 +45,15 @@ def main(argv: list[str] | None = None) -> int:
 
         return server_main(rest)
     if cmd == "fetch-voice":
-        from huggingface_hub import snapshot_download
+        from . import qwen
 
-        snapshot_download(config.QWEN_MODEL)
+        qwen.fetch()
         print("voice ready")
+        return 0
+    if cmd == "qwen-check":
+        from . import qwen
+
+        print(json.dumps(qwen.check()))
         return 0
     if cmd == "stop-server":
         try:

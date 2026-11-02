@@ -36,7 +36,6 @@ Endpoints (all on 127.0.0.1):
 """
 from __future__ import annotations
 
-import gc
 import io
 import json
 import logging
@@ -53,7 +52,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import config, devices, pacing
+from . import config, devices, pacing, qwen
 from .clean import markdown_to_speech, split_sentences
 from .document import DocumentError, group, load, prepare_text, split_long
 
@@ -70,9 +69,7 @@ CLOUD_PIECE = 1200  # characters per request when a cloud voice reads a document
 LEAD_IN = 0.2  # seconds of quiet before speech that starts from silence
 AHEAD = 3  # pieces of speech kept ready; 1 for a cloud voice, where each one is a paid request
 QWEN_PIECE = 280  # characters per piece: it reads better, and less rushed, with several sentences to go on
-QWEN_CHUNK = 1.0  # seconds of its speech between deliveries, so it starts sounding at once
-QWEN_DEFAULT_VOICE = "Aiden"
-QWEN_REST = 300  # seconds unused before it gives back its memory (about 7 GB); loading again takes 2 s
+QWEN_REST = 300  # seconds unused before it gives back its memory; loading again takes a few seconds
 
 
 class Take:
@@ -352,26 +349,22 @@ class Speaker:
 
     def _qwen_stream(self, text: str, voice: str):
         if self._qwen is None:
-            from mlx_audio.tts.utils import load_model  # heavy, and only for this voice
-
             t0 = time.time()
-            self._qwen = load_model(config.QWEN_MODEL)
+            self._qwen = qwen.load()  # heavy, and only for this voice
             log.info("Qwen3-TTS ready in %.1fs", time.time() - t0)
-        speaker = voice if voice.lower() in ("aiden", "ryan") else QWEN_DEFAULT_VOICE
-        results = self._qwen.generate_custom_voice(text=text.strip(), speaker=speaker, language="English",
-                                                   stream=True, streaming_interval=QWEN_CHUNK)
-        for result in results:
+        t0, made = time.time(), 0
+        for audio in self._qwen.stream(text.strip(), qwen.speaker_for(voice)):
             self._qwen_used = time.time()
-            yield np.array(result.audio, dtype=np.float32).reshape(-1)
+            made += len(audio)
+            yield audio
+        # Whether it keeps up on this computer, for anyone reading the log; no text is written.
+        log.info("Qwen3-TTS made %.1fs of speech in %.1fs", made / SAMPLE_RATE, time.time() - t0)
 
     def _rest_qwen(self) -> None:
         if self._qwen is None or time.time() - self._qwen_used < QWEN_REST:
             return
-        import mlx.core as mx
-
+        self._qwen.close()
         self._qwen = None
-        gc.collect()
-        mx.clear_cache()
         log.info("Qwen3-TTS gave back its memory")
 
     def _key(self, env_name: str) -> str:

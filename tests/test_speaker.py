@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-os.environ["CLAUDEVOICE_HOME"] = tempfile.mkdtemp()
+os.environ.setdefault("CLAUDEVOICE_HOME", tempfile.mkdtemp())
 
 import numpy as np  # noqa: E402
 
@@ -138,6 +138,28 @@ class SpeakerTest(unittest.TestCase):
         made = len(self.speaker.made)
         time.sleep(0.15)
         self.assertEqual(len(self.speaker.made), made)
+
+    def test_a_voice_that_cannot_start_says_so_once_and_kokoro_reads_on(self) -> None:
+        said: list[str] = []
+
+        def generate(text, voice, speed):
+            if voice.startswith("qwen:"):
+                raise RuntimeError("the graphics card is not available")
+            said.append(text)
+            yield np.zeros(tts_server.BLOCK, dtype=np.float32)
+
+        self.speaker._generate = generate
+        try:
+            self.call("/read", {"text": "The first paragraph goes here.\n\nThe second paragraph follows it.",
+                                "owner": "a", "engine": "qwen", "voice": "Aiden"})
+            self.wait_until(lambda: not self.speaker.speaking)
+        finally:
+            del self.speaker._generate
+        self.assertEqual(len(said), 3, said)
+        self.assertIn("The Qwen voice is not available", said[0])
+        self.assertTrue(said[1].startswith("The first paragraph"))
+        self.assertTrue(said[2].startswith("The second paragraph"))
+        self.assertIn("graphics card", self.speaker.last_error)
 
     # ---- chats do not touch each other ------------------------------------------
 

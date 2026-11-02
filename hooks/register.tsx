@@ -1168,10 +1168,17 @@ async function loadSettings($: Engine): Promise<VoiceSettings> {
   } catch {
     flat._microphones = ''
   }
-  const platform = await $.process.run([...py, '-c', 'import platform, sys; print(sys.platform, platform.machine())'], { cwd: root($), timeoutMs: 60000 })
-  const [system, machine] = platform.stdout.trim().split(' ')
-  flat._platform = system ?? ''
-  flat._machine = machine ?? ''
+  const platform = await $.process.run([...py, '-c', 'import sys; print(sys.platform)'], { cwd: root($), timeoutMs: 60000 })
+  flat._platform = platform.stdout.trim()
+  const qwen = await $.process.run([...py, '-m', 'claudevoice', 'qwen-check'], { cwd: root($), timeoutMs: 60000 })
+  try {
+    const found = JSON.parse(qwen.stdout) as { can?: boolean; why?: string }
+    flat._qwen = found.can === true ? 'yes' : ''
+    flat._qwenWhy = found.why ?? ''
+  } catch {
+    flat._qwen = ''
+    flat._qwenWhy = ''
+  }
   await update($, settings, () => flat)
   return flat
 }
@@ -1214,14 +1221,15 @@ async function ensureWhisper($: Engine): Promise<boolean> {
 async function ensureQwen($: Engine): Promise<boolean> {
   const r = root($)
   await update($, note, () => 'installing Qwen3-TTS (a few minutes the first time)…')
-  $.ui.toast('Installing Qwen3-TTS: about 2.5 GB to download, once. It speaks when it is ready.')
-  const ran = await $.process.run([await uv($), 'sync', '--project', r, '--quiet', '--inexact', '--extra', 'qwen'], { cwd: r, timeoutMs: 600000 })
-  let last = ran
-  // A run is cut off after ten minutes; on a slow connection the download picks up where it stopped.
-  for (let tries = 0; ran.exitCode === 0 && tries < 4; tries++) {
-    last = await $.process.run([...(await python($)), '-m', 'claudevoice', 'fetch-voice'], { cwd: r, timeoutMs: 600000 })
-    if (last.exitCode === 0) break
+  $.ui.toast('Installing Qwen3-TTS: 2 to 2.5 GB to download, once. It speaks when it is ready.')
+  // A run is cut off after ten minutes; on a slow connection a download picks up where it stopped.
+  const patiently = async (argv: string[]) => {
+    let ran = await $.process.run(argv, { cwd: r, timeoutMs: 600000 })
+    for (let tries = 1; ran.exitCode !== 0 && tries < 4; tries++) ran = await $.process.run(argv, { cwd: r, timeoutMs: 600000 })
+    return ran
   }
+  let last = await patiently([await uv($), 'sync', '--project', r, '--quiet', '--inexact', '--extra', 'qwen'])
+  if (last.exitCode === 0) last = await patiently([...(await python($)), '-m', 'claudevoice', 'fetch-voice'])
   await update($, note, () => '')
   if (last.exitCode !== 0) {
     $.ui.toast(`Qwen3-TTS could not be installed: ${last.stderr.trim().split('\n').pop() ?? ''}`)
@@ -1462,7 +1470,7 @@ async function settingsPane($: Engine, e: Surface) {
       return [{ value: name, label: tag ? `${name} ${tag}` : name }]
     }),
   ]
-  const canQwen = s._platform === 'darwin' && s._machine === 'arm64'
+  const canQwen = s._qwen === 'yes'
   const speaking: Option[] = [
     ...KOKORO_VOICES.map(([v, label]) => ({ value: `kokoro:${v}`, label: `Local Kokoro: ${label}` })),
     ...(canQwen ? QWEN_VOICES.map(([v, label]) => ({ value: `qwen:${v}`, label: `Local Qwen3-TTS, expressive: ${label}` })) : []),
@@ -1594,6 +1602,7 @@ async function settingsPane($: Engine, e: Surface) {
         {row('listening', 'Listening (speech to text)', listening, listeningValue(s), (v: string) => void pickListening($, v))}
         {row('microphone', 'Microphone', microphones, s.input_device ?? '', (v: string) => void setSetting($, 'input_device', v))}
         {row('speaking', 'Speaking (text to speech)', speaking, speakingValue(s), (v: string) => void pickSpeaking($, v))}
+        {!canQwen && (s._qwenWhy ?? '') !== '' && <Text dimColor>The more natural Qwen3-TTS voice is not offered here: {s._qwenWhy}.</Text>}
         {row('speed', speakingValue(s).startsWith('qwen:') ? 'Speed (Qwen3-TTS keeps its own pace)' : 'Speed', speeds, String(Number(s.speed ?? '1.05')), (v: string) => void setSetting($, 'speed', v))}
       </Box>
       <Box marginTop={1}>
