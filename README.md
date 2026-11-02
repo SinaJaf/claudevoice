@@ -97,12 +97,19 @@ Markdown, plain text and PDF work. Headings, lists and tables are read as senten
 are announced rather than spelled out, and a PDF's page numbers, running headers and footers are
 skipped. A scanned PDF (pictures of pages) has no text to read.
 
-The voice reads the way a person does. It stops at colons, semicolons, dashes and parentheses,
-waits longer at the end of a sentence and longer again after a paragraph. A section number is set
-apart from its title ("8", a pause, "Reports and Analysis"), while a number in a sentence ("we have
-8 reports") is read straight on. Chapter VIII reads as "chapter eight", Fig. 3 as "figure three",
-and 10:30 as "ten thirty". The pauses are exact with the Kokoro voices; cloud voices choose their
-own, from the same cleaned-up text.
+Text is cleaned up for listening. A section number is set apart from its title ("Eight", a pause,
+"Reports and Analysis"), while a number in a sentence ("we have 8 reports") is read straight on.
+Chapter VIII reads as "chapter eight", 0.5.1 as "0 point 5 point 1", Fig. 3 as "figure three", and
+`notes.md` as "notes dot M D". On Apple Silicon you can choose the Qwen3-TTS voice for a more natural
+reading; see [Voices](#voices).
+
+## Voices
+
+Choose a voice under **Speaking** in the ⚙ settings.
+
+- **Kokoro** is the default. It runs on any computer and is light on memory and quick to make speech, but its tone is flat: a question mark or an exclamation mark barely changes how it sounds.
+- **Qwen3-TTS** is more natural, with stops that follow the punctuation. It's for Apple Silicon Macs for now, and it's heavy: about 2.5 GB to download the first time you pick it and about 7 GB of memory while it's in use (it gives the memory back after five minutes unused, then takes a few seconds to load again). Its two English voices, Aiden and Ryan, are both male, and **Speed** doesn't change its pace. It reads a few sentences at a time, so after **Pause**, **Resume** goes back to the start of that passage, up to about 20 seconds.
+- **OpenAI and ElevenLabs** are cloud voices. They need an API key, cost money and send your text online.
 
 ## Several chats at once
 
@@ -144,7 +151,7 @@ a setting to choose a different value for the chat you're in, and **Same as all 
 - **Listening**: NVIDIA [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) on your
   computer (default; English, or 25 European languages), the Mac's or Windows' own recognizer,
   Whisper (installed when you pick it), or OpenAI's cloud transcription.
-- **Microphone**, **Speaking** (Kokoro voices, or OpenAI and ElevenLabs cloud voices) and **Speed**.
+- **Microphone**, **Speaking** ([local or cloud voices](#voices)) and **Speed**.
 
 <br clear="right">
 
@@ -163,7 +170,7 @@ The gear covers the common ones. Everything is in `~/.claudevoice/config.json`, 
 | `stt_language` | `` | language for the apple and windows engines (`en-US`, `fa-IR`...); empty follows the system |
 | `whisper_model` | `large-v3-turbo` | `small`, `medium`, `large-v3-turbo`, `large-v3` |
 | `input_device` | `` (system default) | microphone name; empty follows the system's input as it changes |
-| `tts_engine` | `kokoro` | `kokoro`, `openai`, `elevenlabs` |
+| `tts_engine` | `kokoro` | `kokoro`, `qwen` (Apple Silicon), `openai`, `elevenlabs` |
 | `tts_voice`, `tts_model`, `tts_base_url`, `tts_api_key_env` | OpenAI defaults | cloud speech (ElevenLabs voice id goes in `tts_voice`) |
 | `max_chars` | `2500` | longest reply read in full |
 | `port` | `8765` | local server port |
@@ -267,9 +274,10 @@ Claude Code (any surface)
   joined back into paragraphs, broken words mended, headers and page numbers dropped), and the
   server reads it sentence by sentence, keeping its place for Pause and Resume; `clean.py` turns
   markdown into speakable text (code fences become "python code block, 12 lines", paths collapse
-  to file names, `app.py:42` reads as "app.py line 42"). `pacing.py` adds the pauses: Kokoro
-  leaves almost none at punctuation, but says when each word falls, so a sentence is synthesized
-  whole, keeping its melody, and quiet is added at each mark.
+  to file names, `app.py:42` reads as "app.py line 42"). `pacing.py` adds pauses for Kokoro, which
+  leaves few at punctuation but says when each word falls. Speech is made a few pieces ahead of
+  what is playing, by a thread of its own, so a stop between sentences isn't also the time it took
+  to make the next one. Qwen3-TTS (mlx-audio) streams, so it starts within about half a second.
 - Chats stay apart in three places. A window showing a chat attaches to it, so a chat with no
   surface (`$.session.surfaces()`, `session.attach` and `session.detach`) is one you're not in.
   Each chat's listener talks to it through its own folder, `~/.claudevoice/chats/<id>/`. And every
@@ -335,7 +343,8 @@ Edits reach a running session with `/reload-plugins` when the plugin was install
 ## License
 
 MIT, the notification sounds included (`scripts/make_sounds.py` generates them). The models it
-downloads keep their own licenses: Kokoro-82M (Apache-2.0, hexgrad),
+downloads keep their own licenses: Kokoro-82M (Apache-2.0, hexgrad), Qwen3-TTS (Apache-2.0, Alibaba
+Qwen; MLX conversion by mlx-community, run with mlx-audio),
 Parakeet TDT 0.6B v2 and v3 (CC-BY-4.0, NVIDIA; ONNX export by istupakov, run with onnx-asr),
 Smart Turn v3.2 (BSD-2-Clause, Daily / Pipecat) and Silero VAD (MIT, Silero Team). PDFs are read
 with pypdfium2 (Apache-2.0 or BSD-3-Clause) and PDFium (BSD-3-Clause).

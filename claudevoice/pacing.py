@@ -7,6 +7,8 @@ quiet is then added at each mark, up to the length a reader would give it.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
+
 import numpy as np
 
 SAMPLE_RATE = 24_000
@@ -130,12 +132,36 @@ def _fade(audio: np.ndarray, *, out: bool) -> np.ndarray:
     return audio
 
 
-def _trim(audio: np.ndarray, lead: float = 0.02, tail: float = 0.05) -> np.ndarray:
+def _trim(audio: np.ndarray) -> np.ndarray:
     """Cut the quiet a piece starts and ends with, so the pauses between pieces are the ones asked for."""
-    loud = _loudness(audio)
-    sounding = np.flatnonzero(loud >= _EDGE)
+    return _trim_end(_trim_start(audio))
+
+
+def _trim_start(audio: np.ndarray, lead: float = 0.02) -> np.ndarray:
+    sounding = np.flatnonzero(_loudness(audio) >= _EDGE)
     if len(sounding) == 0:
         return audio
-    first = max(0, int(sounding[0]) * _FRAME - int(SAMPLE_RATE * lead))
-    last = min(len(audio), (int(sounding[-1]) + 1) * _FRAME + int(SAMPLE_RATE * tail))
-    return audio[first:last]
+    return audio[max(0, int(sounding[0]) * _FRAME - int(SAMPLE_RATE * lead)):]
+
+
+def _trim_end(audio: np.ndarray, tail: float = 0.05) -> np.ndarray:
+    sounding = np.flatnonzero(_loudness(audio) >= _EDGE)
+    if len(sounding) == 0:
+        return audio
+    return audio[: min(len(audio), (int(sounding[-1]) + 1) * _FRAME + int(SAMPLE_RATE * tail))]
+
+
+def trim_stream(chunks: Iterable[np.ndarray]) -> Iterator[np.ndarray]:
+    """The same for audio that arrives in chunks. The newest chunk is held back until
+    the next one comes, because the last one is the one to trim."""
+    held: np.ndarray | None = None
+    for chunk in chunks:
+        if held is None:
+            if not (_loudness(chunk) >= _EDGE).any():
+                continue  # nothing but the quiet before speech
+            held = _trim_start(chunk)
+            continue
+        yield held
+        held = chunk
+    if held is not None:
+        yield _trim_end(held)

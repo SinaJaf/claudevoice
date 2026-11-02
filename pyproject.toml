@@ -1,6 +1,6 @@
 [project]
 name = "claudevoice"
-version = "0.5.1"
+version = "0.6.0"
 description = "Voice for Claude Code: Kokoro speech, local or cloud listening"
 readme = "README.md"
 license = "MIT"
@@ -31,6 +31,11 @@ dependencies = [
 whisper = [
     "mlx-whisper>=0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "faster-whisper>=1.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
+]
+# Qwen3-TTS, the expressive voice: Apple Silicon only for now. The plugin installs it when you pick it.
+qwen = [
+    "mlx-audio==0.6.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "requests>=2.31; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.scripts]

@@ -140,6 +140,16 @@ async function python($: Engine): Promise<string[]> {
 
 let synced = false
 
+/** A voice already chosen comes along when a new version of the plugin makes its own venv. */
+async function chosenExtras($: Engine): Promise<string[]> {
+  try {
+    const config = JSON.parse(await $.fs.read(await flagPath($, 'config.json'))) as { tts_engine?: string }
+    return config.tts_engine === 'qwen' ? ['--extra', 'qwen'] : []
+  } catch {
+    return []
+  }
+}
+
 /** First use on a machine: create the venv and pull the speech packages (a few minutes).
  *  After an update, bring an existing venv in line with the lock once per load (quick
  *  when nothing changed), so new engines find their packages. */
@@ -150,7 +160,7 @@ async function ensurePython($: Engine): Promise<boolean> {
       synced = true
       await update($, note, () => 'checking the voice engine…')
       // --inexact keeps optional engines (Whisper) a user has added.
-      await $.process.run([await uv($), 'sync', '--project', r, '--quiet', '--inexact'], { cwd: r, timeoutMs: 600000 })
+      await $.process.run([await uv($), 'sync', '--project', r, '--quiet', '--inexact', ...(await chosenExtras($))], { cwd: r, timeoutMs: 600000 })
       await update($, note, () => '')
     }
     return true
@@ -158,7 +168,7 @@ async function ensurePython($: Engine): Promise<boolean> {
   const uvPath = await ensureUv($)
   if (uvPath === '') return false
   await setupNote($, 'Setting up the voice, first time only: a few minutes (about 1 GB to download)…')
-  const ran = await $.process.run([uvPath, 'sync', '--project', r], { cwd: r, timeoutMs: 600000 })
+  const ran = await $.process.run([uvPath, 'sync', '--project', r, ...(await chosenExtras($))], { cwd: r, timeoutMs: 600000 })
   await setupNote($, '')
   if (ran.exitCode !== 0) {
     const why = ran.stderr.trim().split('\n').pop() ?? ''
@@ -333,6 +343,7 @@ async function setChatSetting($: Engine, key: keyof ChatSettings, value: string)
   if (key === 'patience' || key === 'talkOver') await shareLiveSettings($)
   if (key === 'sounds' && value === 'on') void sampleSounds($)
   if (key === 'listening' && value.startsWith('local:')) await ensureWhisper($)
+  if (key === 'speaking' && value.startsWith('qwen:')) await ensureQwen($)
 }
 
 async function modeHere($: Engine): Promise<ListenMode> {
@@ -1134,6 +1145,7 @@ const KOKORO_VOICES: readonly [string, string][] = [
   ['am_michael', 'Michael (US)'], ['am_fenrir', 'Fenrir (US)'],
   ['bf_emma', 'Emma (UK)'], ['bm_george', 'George (UK)'], ['bm_fable', 'Fable (UK)'],
 ]
+const QWEN_VOICES: readonly [string, string][] = [['Aiden', 'Aiden (US, clear)'], ['Ryan', 'Ryan (lively)']]
 const OPENAI_VOICES = ['alloy', 'ash', 'coral', 'echo', 'nova', 'onyx', 'sage', 'shimmer'] as const
 const SPEEDS = ['0.9', '1.0', '1.05', '1.15', '1.25'] as const
 
@@ -1156,8 +1168,10 @@ async function loadSettings($: Engine): Promise<VoiceSettings> {
   } catch {
     flat._microphones = ''
   }
-  const platform = await $.process.run([...py, '-c', 'import sys; print(sys.platform)'], { cwd: root($), timeoutMs: 60000 })
-  flat._platform = platform.stdout.trim()
+  const platform = await $.process.run([...py, '-c', 'import platform, sys; print(sys.platform, platform.machine())'], { cwd: root($), timeoutMs: 60000 })
+  const [system, machine] = platform.stdout.trim().split(' ')
+  flat._platform = system ?? ''
+  flat._machine = machine ?? ''
   await update($, settings, () => flat)
   return flat
 }
@@ -1196,6 +1210,26 @@ async function ensureWhisper($: Engine): Promise<boolean> {
   return true
 }
 
+/** Qwen3-TTS is an optional voice too, and a large one: install it, then fetch the model, with word of both. */
+async function ensureQwen($: Engine): Promise<boolean> {
+  const r = root($)
+  await update($, note, () => 'installing Qwen3-TTS (a few minutes the first time)…')
+  $.ui.toast('Installing Qwen3-TTS: about 2.5 GB to download, once. It speaks when it is ready.')
+  const ran = await $.process.run([await uv($), 'sync', '--project', r, '--quiet', '--inexact', '--extra', 'qwen'], { cwd: r, timeoutMs: 600000 })
+  let last = ran
+  // A run is cut off after ten minutes; on a slow connection the download picks up where it stopped.
+  for (let tries = 0; ran.exitCode === 0 && tries < 4; tries++) {
+    last = await $.process.run([...(await python($)), '-m', 'claudevoice', 'fetch-voice'], { cwd: r, timeoutMs: 600000 })
+    if (last.exitCode === 0) break
+  }
+  await update($, note, () => '')
+  if (last.exitCode !== 0) {
+    $.ui.toast(`Qwen3-TTS could not be installed: ${last.stderr.trim().split('\n').pop() ?? ''}`)
+    return false
+  }
+  return true
+}
+
 async function pickListening($: Engine, value: string): Promise<void> {
   const [engine, model] = value.split(':', 2) as [string, string]
   if (engine === 'local' && !(await ensureWhisper($))) return
@@ -1211,6 +1245,7 @@ function speakingValue(s: VoiceSettings): string {
 }
 async function pickSpeaking($: Engine, value: string): Promise<void> {
   const [engine, voice] = value.split(':', 2) as [string, string]
+  if (engine === 'qwen' && !(await ensureQwen($))) return
   await setSetting($, 'tts_engine', engine)
   if (engine === 'kokoro') await setSetting($, 'voice', voice)
   else if (voice !== '') await setSetting($, 'tts_voice', voice)
@@ -1427,8 +1462,10 @@ async function settingsPane($: Engine, e: Surface) {
       return [{ value: name, label: tag ? `${name} ${tag}` : name }]
     }),
   ]
+  const canQwen = s._platform === 'darwin' && s._machine === 'arm64'
   const speaking: Option[] = [
     ...KOKORO_VOICES.map(([v, label]) => ({ value: `kokoro:${v}`, label: `Local Kokoro: ${label}` })),
+    ...(canQwen ? QWEN_VOICES.map(([v, label]) => ({ value: `qwen:${v}`, label: `Local Qwen3-TTS, expressive: ${label}` })) : []),
     ...OPENAI_VOICES.map(v => ({ value: `openai:${v}`, label: `Cloud OpenAI: ${v}` })),
     { value: 'elevenlabs:', label: `Cloud ElevenLabs: voice ${s.tts_voice ?? ''}` },
   ]
@@ -1557,7 +1594,7 @@ async function settingsPane($: Engine, e: Surface) {
         {row('listening', 'Listening (speech to text)', listening, listeningValue(s), (v: string) => void pickListening($, v))}
         {row('microphone', 'Microphone', microphones, s.input_device ?? '', (v: string) => void setSetting($, 'input_device', v))}
         {row('speaking', 'Speaking (text to speech)', speaking, speakingValue(s), (v: string) => void pickSpeaking($, v))}
-        {row('speed', 'Speed', speeds, String(Number(s.speed ?? '1.05')), (v: string) => void setSetting($, 'speed', v))}
+        {row('speed', speakingValue(s).startsWith('qwen:') ? 'Speed (Qwen3-TTS keeps its own pace)' : 'Speed', speeds, String(Number(s.speed ?? '1.05')), (v: string) => void setSetting($, 'speed', v))}
       </Box>
       <Box marginTop={1}>
         <Text dimColor>Parakeet runs on this computer and downloads about 650 MB once. Cloud engines read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>

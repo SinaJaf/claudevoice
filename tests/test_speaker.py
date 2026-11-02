@@ -27,10 +27,19 @@ class Silent(tts_server.Speaker):
     def __init__(self, cfg: dict) -> None:
         super().__init__(cfg)
         self.played: list[str] = []
+        self.made: list[str] = []
+        self.making = 0.0  # seconds each piece takes to make
 
     def _generate(self, text, engine_voice, speed):
-        self.played.append(text)
+        self.made.append(text)
+        time.sleep(self.making)
         yield np.zeros(tts_server.BLOCK * 2, dtype=np.float32)
+
+    def _pick(self):
+        reading = super()._pick()
+        if reading is not None:
+            self.played.append(reading.pieces[reading.at])
+        return reading
 
     def _ensure_stream(self, new_reply=False):
         pass
@@ -43,7 +52,7 @@ class SpeakerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.speaker = Silent(config.load())
-        cls.speaker._worker.start()
+        cls.speaker.start_threads()
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), tts_server.make_handler(cls.speaker, config.load()))
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
@@ -57,6 +66,8 @@ class SpeakerTest(unittest.TestCase):
         self.speaker.stop()
         self.wait_until(lambda: not self.speaker.speaking)
         self.speaker.played.clear()
+        self.speaker.made.clear()
+        self.speaker.making = 0.0
 
     def call(self, path: str, body: dict | None = None) -> dict:
         data = None if body is None else json.dumps(body).encode()
@@ -83,6 +94,50 @@ class SpeakerTest(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         return path
+
+    # ---- making speech ahead ------------------------------------------------------
+
+    def test_speech_is_made_ahead_of_what_is_playing(self) -> None:
+        self.call("/speak", {"text": LONG, "owner": "a"})
+        self.wait_until(lambda: len(self.speaker.made) >= tts_server.AHEAD)
+        self.assertLessEqual(len(self.speaker.played), 2, "made before it is reached")
+        self.assertLessEqual(len(self.speaker.made), len(self.speaker.played) + tts_server.AHEAD, "only a few ahead")
+
+    def test_a_stop_does_not_wait_for_the_next_piece_to_be_made(self) -> None:
+        self.speaker.making = 0.1  # a piece takes longer to make than the one before takes to play
+        waits: list[float] = []
+        original = self.speaker._next_audio
+        def timed(take, at):
+            t0 = time.time()
+            audio = original(take, at)
+            if at == 0 and audio is not None:
+                waits.append(time.time() - t0)
+            return audio
+        self.speaker._next_audio = timed
+        try:
+            self.call("/speak", {"text": LONG, "owner": "a"})
+            self.wait_until(lambda: len(waits) >= 4, 15)
+        finally:
+            del self.speaker._next_audio
+        self.assertLess(max(waits[:4]), 0.05, "already made when its turn came")
+
+    def test_stopping_ends_the_making_too(self) -> None:
+        self.call("/speak", {"text": LONG, "owner": "a"})
+        self.wait_until(lambda: len(self.speaker.made) >= 1)
+        self.call("/stop", {"owner": "a"})
+        self.wait_until(lambda: not self.speaker.speaking)
+        made = len(self.speaker.made)
+        time.sleep(0.15)
+        self.assertLessEqual(len(self.speaker.made), made + 1, "at most the one already under way")
+
+    def test_a_paused_chat_makes_nothing_more(self) -> None:
+        self.call("/speak", {"text": LONG, "owner": "a"})
+        self.wait_until(lambda: len(self.speaker.played) >= 1)
+        self.call("/pause", {"owner": "a"})
+        time.sleep(0.05)
+        made = len(self.speaker.made)
+        time.sleep(0.15)
+        self.assertEqual(len(self.speaker.made), made)
 
     # ---- chats do not touch each other ------------------------------------------
 

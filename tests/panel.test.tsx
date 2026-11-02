@@ -146,7 +146,8 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     }
     const isListen = e.argv.includes('claudevoice.listen') && !e.argv.includes('--warm')
     const isConfigRead = e.argv.includes('config') && e.argv.length === 4
-    const stdout = e.argv.includes('--devices')
+    const isPlatformRead = e.argv.some(a => a.includes('platform.machine'))
+    const stdout = isPlatformRead ? (opts.mac === false ? 'win32 AMD64' : 'darwin arm64') : e.argv.includes('--devices')
       ? JSON.stringify(mics.list)
       : isListen
         ? JSON.stringify({ text: 'what time is it', seconds: 2.1 })
@@ -1194,4 +1195,42 @@ test('With always notify on, a question is announced in words, not as a permissi
   await $.classic.PermissionRequest({ tool_name: 'AskUserQuestion', tool_input: {} })
   await clock.advance(10)
   expect(said(w)).toEqual(['Claude needs your answer to a question.'])
+})
+
+test('Picking Qwen3-TTS installs it and fetches the voice before switching to it', async ($, on) => {
+  const w = world(on, { speaking: false }, { mac: true })
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'settings' })
+  await clock.advance(10)
+  await ui.unmount()
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  await pane.select({ key: 'speaking', value: 'qwen:Aiden' })
+  await clock.advance(10)
+  const install = w.runs.findIndex(argv => argv.includes('sync') && argv.includes('qwen'))
+  const fetch = w.runs.findIndex(argv => argv.includes('fetch-voice'))
+  const saved = w.runs.findIndex(argv => argv.includes('config') && argv.includes('tts_engine') && argv.includes('qwen'))
+  expect(install).toBeGreaterThan(-1)
+  expect(fetch).toBeGreaterThan(install)
+  expect(saved).toBeGreaterThan(fetch)
+  await pane.unmount()
+})
+
+test('Qwen3-TTS is offered only on Apple Silicon', async ($, on) => {
+  world(on, { speaking: false }, { mac: false })
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.press({ key: 'settings' })
+  await clock.advance(10)
+  await ui.unmount()
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  expect(await pane.find({ type: 'Text', text: /Speaking/ })).toBeDefined()
+  const options = (await pane.find({ type: 'Select', key: 'speaking' }))?.props.options as { value: string }[]
+  expect(options.some(o => o.value.startsWith('kokoro:'))).toBe(true)
+  expect(options.some(o => o.value.startsWith('qwen:'))).toBe(false)
+  await pane.unmount()
 })

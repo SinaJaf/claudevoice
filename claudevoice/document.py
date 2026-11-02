@@ -254,16 +254,17 @@ def split_long(sentences: list[str], limit: int = 400) -> list[str]:
 
 
 def group(sentences: list[str], limit: int) -> list[str]:
-    """Join sentences into pieces of up to `limit` characters (for cloud voices, which
-    take one request per piece)."""
+    """Join sentences into pieces of up to `limit` characters, each paragraph apart, for voices
+    that read better with more than a sentence in front of them (and cloud voices, which take
+    one request per piece). A piece keeps the line break it ended on."""
     pieces: list[str] = []
     buf = ""
     for s in sentences:
-        if buf and len(buf) + 1 + len(s) > limit:
+        if buf and (buf.endswith("\n\n") or len(buf) + 1 + len(s) > limit):
             pieces.append(buf)
             buf = s
         else:
-            buf = f"{buf} {s}".strip()
+            buf = f"{buf.rstrip()} {s}" if buf else s
     if buf:
         pieces.append(buf)
     return pieces

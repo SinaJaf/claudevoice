@@ -11,7 +11,7 @@ import numpy as np
 
 from claudevoice import pacing
 from claudevoice.clean import StreamingSentenceSplitter, markdown_to_speech as spoken, split_sentences
-from claudevoice.document import split_long
+from claudevoice.document import group, split_long
 
 RATE = pacing.SAMPLE_RATE
 
@@ -43,7 +43,7 @@ class Headings(unittest.TestCase):
     def test_a_section_number_is_marked_off_from_its_title(self) -> None:
         for written in ("## 8 Reports and Analysis", "## 8. Reports and Analysis", "8 Reports and Analysis",
                         "**8 Reports and Analysis**", "8) Reports and Analysis"):
-            self.assertEqual(spoken(written).rstrip("."), "8. Reports and Analysis", written)
+            self.assertEqual(spoken(written).rstrip("."), "Eight. Reports and Analysis", written)
         self.assertEqual(spoken("## 8.1 Overview"), "8.1. Overview.")
 
     def test_a_number_in_a_sentence_stays_where_it_is(self) -> None:
@@ -55,7 +55,8 @@ class Headings(unittest.TestCase):
         self.assertEqual(spoken("2024 Annual Report"), "2024 Annual Report")
 
     def test_a_list_keeps_its_numbers(self) -> None:
-        self.assertEqual(spoken("1. Do this\n2) Do that\n- a bullet"), "1. Do this.\n2. Do that.\na bullet")
+        self.assertEqual(spoken("1. Do this\n2) Do that\n- a bullet"), "One. Do this.\nTwo. Do that.\na bullet")
+        self.assertEqual(spoken("21. Far down the list"), "21. Far down the list")
 
     def test_named_parts(self) -> None:
         self.assertEqual(spoken("Chapter 8 Reports and Analysis"), "Chapter 8. Reports and Analysis.")
@@ -65,13 +66,13 @@ class Headings(unittest.TestCase):
     def test_roman_numerals_read_as_numbers(self) -> None:
         self.assertEqual(spoken("Chapter VIII"), "Chapter 8")
         self.assertEqual(spoken("See Part IV for more."), "See Part 4 for more.")
-        self.assertEqual(spoken("IV. Results"), "4. Results.")
+        self.assertEqual(spoken("IV. Results"), "Four. Results.")
         self.assertEqual(spoken("Section C and Appendix V."), "Section C and Appendix V.")
         self.assertEqual(spoken("V. Putin spoke at length, then left."), "V. Putin spoke at length, then left.")
 
     def test_a_heading_stands_apart_from_the_text_below(self) -> None:
         pieces = split_sentences(spoken("## 8 Reports\nThe text goes on from here."))
-        self.assertEqual(pieces, ["8. Reports.\n\n", "The text goes on from here."])
+        self.assertEqual(pieces, ["Eight. Reports.\n\n", "The text goes on from here."])
         self.assertEqual(pacing.pause_after(pieces[0]), pacing.PARAGRAPH)
 
 
@@ -102,6 +103,48 @@ class Marks(unittest.TestCase):
         self.assertEqual(spoken("The file(s) here."), "The files here.")
 
 
+class Technical(unittest.TestCase):
+    def test_version_numbers_keep_their_dots(self) -> None:
+        self.assertEqual(spoken("We are on version 0.5.1 now."), "We are on version 0 point 5 point 1 now.")
+        self.assertEqual(spoken("Version 0.5.0 is out."), "Version 0 point 5 point 0 is out.")
+        self.assertEqual(spoken("Install v0.5.1 today."), "Install version 0 point 5 point 1 today.")
+        self.assertEqual(spoken("The version v1.2.3 works."), "The version 1 point 2 point 3 works.")
+        self.assertEqual(spoken("Python 3.10 runs."), "Python 3.10 runs.")
+        self.assertEqual(spoken("Open 127.0.0.1 now."), "Open 127.0.0.1 now.")
+
+    def test_file_names_are_spelled(self) -> None:
+        self.assertEqual(spoken("Open `pacing.py` and report.pdf."), "Open pacing dot P Y and report dot P D F.")
+        self.assertEqual(spoken("See tts_server.py:42 now."), "See tts server dot P Y line 42 now.")
+        self.assertEqual(spoken("Read README.md first."), "Read README dot M D first.")
+        self.assertEqual(spoken("See claudevoice/pacing.py here."), "See pacing dot P Y here.")
+
+    def test_keys(self) -> None:
+        self.assertEqual(spoken("Press Ctrl+C or \u2318C to copy."), "Press control C or command C to copy.")
+        self.assertEqual(spoken("Press \u2318 C."), "Press command C.")
+
+    def test_commits_are_short_and_spelled(self) -> None:
+        self.assertEqual(spoken("It is commit `7f3e676` now."), "It is commit 7 F 3 E 6 7 6 now.")
+        self.assertEqual(spoken("Hash 7f3e676467da37c8ba8d23a4e9684a019b92449d here."), "Hash 7 F 3 E 6 7 6 here.")
+        self.assertEqual(spoken("A deadbeef and a decade."), "A deadbeef and a decade.")
+
+    def test_names_in_code_read_as_words(self) -> None:
+        self.assertEqual(spoken("Then type `/reload-plugins` now."), "Then type reload plugins now.")
+        self.assertEqual(spoken("Run it with `--help` now."), "Run it with dash dash help now.")
+        self.assertEqual(spoken("A well-known name stays."), "A well-known name stays.")
+
+    def test_lines_of_a_file(self) -> None:
+        self.assertEqual(spoken("Type `@notes.md#L40-80` here."), "Type at notes dot M D line 40 to 80 here.")
+
+    def test_at_signs(self) -> None:
+        self.assertEqual(spoken("Pick (@notes.md, or @report.pdf)."), "Pick (at notes dot M D, or at report dot P D F).")
+        self.assertEqual(spoken("Mail me@example.org now."), "Mail me@example.org now.")
+
+    def test_signs_are_said_or_dropped(self) -> None:
+        self.assertEqual(spoken("Press \u25cf Call now."), "Press Call now.")
+        self.assertEqual(spoken("Copy \u2192 paste."), "Copy to paste.")
+        self.assertEqual(spoken("See issue #12 now."), "See issue number 12 now.")
+
+
 class Sentences(unittest.TestCase):
     def test_a_title_does_not_end_the_sentence(self) -> None:
         self.assertEqual(len(split_sentences("Dr. Smith went to the office to see Mr. Jones about the plan today.")), 1)
@@ -114,6 +157,11 @@ class Sentences(unittest.TestCase):
         pieces = split_long(["word " * 200 + "end.\n\n"])
         self.assertTrue(pieces[-1].endswith("\n\n"))
         self.assertTrue(all(len(p) <= 402 for p in pieces))
+
+    def test_grouping_keeps_paragraphs_apart(self) -> None:
+        pieces = group(["One sentence.\n", "Two sentence.\n\n", "Three sentence.", "Four sentence."], 200)
+        self.assertEqual(pieces, ["One sentence. Two sentence.\n\n", "Three sentence. Four sentence."])
+        self.assertEqual(group(["A long one here.", "Another long one."], 20), ["A long one here.", "Another long one."])
 
     def test_streaming_knows_titles_too(self) -> None:
         splitter = StreamingSentenceSplitter(min_chars=5)
@@ -163,6 +211,17 @@ class Pauses(unittest.TestCase):
     def test_the_ends_are_trimmed(self) -> None:
         audio = np.concatenate([np.zeros(RATE, dtype=np.float32), tone(0.5), np.zeros(RATE, dtype=np.float32)])
         self.assertLess(len(pacing.pace(audio, None)), RATE * 0.6)
+
+    def test_a_stream_is_trimmed_at_both_ends(self) -> None:
+        quiet = np.zeros(RATE // 2, dtype=np.float32)
+        chunks = [quiet, np.concatenate([quiet, tone(0.2)]), tone(0.5), np.concatenate([tone(0.2), quiet])]
+        out = list(pacing.trim_stream(chunks))
+        self.assertEqual(len(out), 3, "the quiet chunk before speech is dropped")
+        self.assertLess(sum(len(c) for c in out) / RATE, 1.0)
+        self.assertGreater(sum(len(c) for c in out) / RATE, 0.9)
+
+    def test_a_silent_stream_gives_nothing(self) -> None:
+        self.assertEqual(list(pacing.trim_stream([np.zeros(RATE, dtype=np.float32)])), [])
 
     def test_nothing_but_quiet_is_left_alone(self) -> None:
         audio = np.zeros(RATE, dtype=np.float32)

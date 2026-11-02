@@ -49,6 +49,9 @@ def background() -> dict:
         return {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
     return {"start_new_session": True}
 
+# The expressive local voice: Qwen3-TTS's smallest version with built-in voices, for Apple Silicon.
+QWEN_MODEL = "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-8bit"
+
 DEFAULTS: dict = {
     # Kokoro voice. Blend voices by listing several, e.g. "af_heart,af_bella".
     # See https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md
@@ -73,7 +76,7 @@ DEFAULTS: dict = {
     "stt_model": "gpt-4o-mini-transcribe",
     "stt_base_url": "https://api.openai.com/v1",
     "stt_api_key_env": "OPENAI_API_KEY",
-    # Speaking (text-to-speech). "kokoro" is local; "openai" and "elevenlabs" are cloud.
+    # Speaking (text-to-speech). "kokoro" and "qwen" are local; "openai" and "elevenlabs" are cloud.
     # Cloud keys are read from the environment variable named here, never stored in this file.
     "tts_engine": "kokoro",
     "tts_voice": "nova",

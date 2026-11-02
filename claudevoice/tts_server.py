@@ -8,6 +8,10 @@ chat (`owner`). Each chat has its own speech and its own place in a reading, and
 pausing one chat leaves the others alone. One sentence plays at a time, so voices never overlap:
 the chat on screen (`front`) goes first, then the rest in the order they asked.
 
+Two threads do the work. One makes speech, a few pieces ahead of what is playing; the other
+plays it. So a stop between sentences is the pause asked for, and not also the time it took
+to make the next one.
+
 Endpoints (all on 127.0.0.1):
   GET  /health[?owner=C]  -> {"ok": true, "speaking": bool, "busy": bool, "held": bool,
                               "reading": {title, at, of, paused} | null, "voice": str, ...}
@@ -32,6 +36,7 @@ Endpoints (all on 127.0.0.1):
 """
 from __future__ import annotations
 
+import gc
 import io
 import json
 import logging
@@ -63,6 +68,20 @@ ROOT = str(Path(__file__).resolve().parent.parent)
 
 CLOUD_PIECE = 1200  # characters per request when a cloud voice reads a document
 LEAD_IN = 0.2  # seconds of quiet before speech that starts from silence
+AHEAD = 3  # pieces of speech kept ready; 1 for a cloud voice, where each one is a paid request
+QWEN_PIECE = 280  # characters per piece: it reads better, and less rushed, with several sentences to go on
+QWEN_CHUNK = 1.0  # seconds of its speech between deliveries, so it starts sounding at once
+QWEN_DEFAULT_VOICE = "Aiden"
+QWEN_REST = 300  # seconds unused before it gives back its memory (about 7 GB); loading again takes 2 s
+
+
+class Take:
+    """A piece's audio: chunks arrive from the thread making speech as the other plays them."""
+
+    def __init__(self) -> None:
+        self.chunks: list[np.ndarray] = []
+        self.started = False
+        self.done = False
 
 
 class Reading:
@@ -78,6 +97,9 @@ class Reading:
         self.front, self.order = front, order
         self.at = 0
         self.paused = False
+        self.takes: dict[int, Take] = {}  # by piece: what is made, or being made, ahead
+        self.gone = False  # stopped or replaced: nothing more to make
+        self.warned = False  # said why its voice is not available
 
     @property
     def active(self) -> bool:
@@ -101,12 +123,16 @@ class Speaker:
         self._wake = threading.Event()
         self._lock = threading.Lock()
         self.pipeline = None
+        self._qwen = None
+        self._qwen_used = 0.0
         self.last_error = ""
         self.output_device = ""
         self._stream = None
         self._stream_output: int | None = None
         self._last_device_check = 0.0
-        self._worker = threading.Thread(target=self._run, name="kokoro-worker", daemon=True)
+        self._make_more = threading.Event()
+        self._worker = threading.Thread(target=self._run, name="voice-player", daemon=True)
+        self._maker = threading.Thread(target=self._make_speech, name="voice-maker", daemon=True)
 
     def start(self) -> None:
         t0 = time.time()
@@ -118,6 +144,10 @@ class Speaker:
         for _ in self.pipeline("Ready.", voice=self.cfg["voice"], speed=1.0):
             pass
         log.info("Kokoro ready in %.1fs (voice=%s)", time.time() - t0, self.cfg["voice"])
+        self.start_threads()
+
+    def start_threads(self) -> None:
+        self._maker.start()
         self._worker.start()
 
     # -- public API -----------------------------------------------------------
@@ -149,13 +179,18 @@ class Speaker:
             voice = voice or self.cfg["voice"]
         else:
             voice = voice or self.cfg["tts_voice"]
-        speed = float(speed or self.cfg["speed"])
-        # Local synthesis streams sentence by sentence; a cloud engine takes the whole text at once.
-        chunks = split_sentences(text) if engine == "kokoro" else ([text.strip()] if text.strip() else [])
+        speed = self._pace(engine, speed)
+        # Kokoro goes sentence by sentence; a cloud engine takes the whole text at once.
+        if engine == "kokoro":
+            chunks = split_sentences(text)
+        elif engine == "qwen":
+            chunks = group(split_long(split_sentences(text)), QWEN_PIECE)
+        else:
+            chunks = [text.strip()] if text.strip() else []
         with self._lock:
             if interrupt:
                 self._halt(owner)  # a reading cut off this way can be resumed
-                self._speech.pop(owner, None)
+                self._drop(self._speech, owner)
             if not chunks:
                 return 0
             log.info("speak %d chars as %s:%s", len(text), engine, voice)
@@ -164,7 +199,7 @@ class Speaker:
                 current.pieces.extend(chunks)  # sentences streaming in: they follow on
             else:
                 self._speech[owner] = self._new(owner, "", chunks, f"{engine}:{voice}", speed, front)
-        self._wake.set()
+        self._stir()
         return len(chunks)
 
     def read(self, title: str, text: str, *, voice: str | None, speed: float | None,
@@ -174,16 +209,16 @@ class Speaker:
         self.cfg = config.load()
         engine = engine or self.cfg.get("tts_engine", "kokoro")
         voice = voice or (self.cfg["voice"] if engine == "kokoro" else self.cfg["tts_voice"])
-        speed = float(speed or self.cfg["speed"])
+        speed = self._pace(engine, speed)
         pieces = split_long(split_sentences(text))
         if engine != "kokoro":
-            pieces = group(pieces, CLOUD_PIECE)
+            pieces = group(pieces, QWEN_PIECE if engine == "qwen" else CLOUD_PIECE)
         if not pieces:
             return 0
         log.info("read %s: %d chars in %d pieces as %s:%s", title, len(text), len(pieces), engine, voice)
         with self._lock:
             self._docs[owner] = self._new(owner, title, pieces, f"{engine}:{voice}", speed, front)
-        self._wake.set()
+        self._stir()
         return len(pieces)
 
     def pause(self, owner: str = "") -> None:
@@ -198,7 +233,7 @@ class Speaker:
             for held in (self._speech.get(owner), self._docs.get(owner)):
                 if held is not None and held.paused and held.at < len(held.pieces):
                     held.paused = False
-                    self._wake.set()
+                    self._stir()
                     return True
             return any(r.active for r in self._of(owner))
 
@@ -222,6 +257,14 @@ class Speaker:
                 return False
             time.sleep(0.05)
         return True
+
+    def _pace(self, engine: str, speed: float | None) -> float:
+        """Qwen3-TTS has no speed control, so its pauses stay at their full length too."""
+        return 1.0 if engine == "qwen" else float(speed or self.cfg["speed"])
+
+    def _stir(self) -> None:
+        self._wake.set()
+        self._make_more.set()
 
     # -- each chat's speech (call these holding the lock) -------------------------
     def _all(self) -> list[Reading]:
@@ -247,10 +290,15 @@ class Speaker:
         if self._playing is not None and self._playing.owner == owner:
             self._stop_playback.set()
 
+    def _drop(self, slots: dict[str, Reading], owner: str) -> None:
+        reading = slots.pop(owner, None)
+        if reading is not None:
+            reading.gone = True
+
     def _forget(self, owner: str) -> None:
         self._halt(owner)
-        self._speech.pop(owner, None)
-        self._docs.pop(owner, None)
+        self._drop(self._speech, owner)
+        self._drop(self._docs, owner)
 
     def _pick(self) -> Reading | None:
         """The next speech to play a sentence of: the chat on screen first, then the oldest."""
@@ -270,6 +318,7 @@ class Speaker:
             if interrupted or self._stop_playback.is_set() or reading.at != index:
                 return
             reading.at = index + 1
+            reading.takes.pop(index, None)
             if reading.at >= len(reading.pieces):
                 for slots in (self._speech, self._docs):
                     if slots.get(reading.owner) is reading:
@@ -289,6 +338,8 @@ class Speaker:
             yield self._cloud_openai(text, voice, speed)
         elif engine == "elevenlabs":
             yield self._cloud_elevenlabs(text, voice)
+        elif engine == "qwen":
+            yield from pacing.trim_stream(self._qwen_stream(text, voice))
         else:
             gap = 0.0
             for result in self.pipeline(text, voice=voice, speed=speed):
@@ -298,6 +349,30 @@ class Speaker:
                     yield pacing.silence(gap)
                 yield pacing.pace(result.audio.detach().cpu().numpy().astype(np.float32), result.tokens, speed)
                 gap = pacing.pause_after(result.graphemes, speed)
+
+    def _qwen_stream(self, text: str, voice: str):
+        if self._qwen is None:
+            from mlx_audio.tts.utils import load_model  # heavy, and only for this voice
+
+            t0 = time.time()
+            self._qwen = load_model(config.QWEN_MODEL)
+            log.info("Qwen3-TTS ready in %.1fs", time.time() - t0)
+        speaker = voice if voice.lower() in ("aiden", "ryan") else QWEN_DEFAULT_VOICE
+        results = self._qwen.generate_custom_voice(text=text.strip(), speaker=speaker, language="English",
+                                                   stream=True, streaming_interval=QWEN_CHUNK)
+        for result in results:
+            self._qwen_used = time.time()
+            yield np.array(result.audio, dtype=np.float32).reshape(-1)
+
+    def _rest_qwen(self) -> None:
+        if self._qwen is None or time.time() - self._qwen_used < QWEN_REST:
+            return
+        import mlx.core as mx
+
+        self._qwen = None
+        gc.collect()
+        mx.clear_cache()
+        log.info("Qwen3-TTS gave back its memory")
 
     def _key(self, env_name: str) -> str:
         key = os.environ.get(env_name, "") or _login_shell_var(env_name)
@@ -388,6 +463,58 @@ class Speaker:
             self._open_stream()
             self._stream.write(block)
 
+    # -- making speech ahead --------------------------------------------------
+    def _next_to_make(self) -> tuple[Reading, int, Take] | None:
+        """The next piece without audio, for the chat that plays first."""
+        with self._lock:
+            for reading in sorted((r for r in self._all() if r.active), key=lambda r: (not r.front, r.order)):
+                ahead = 1 if reading.engine_voice.split(":")[0] in ("openai", "elevenlabs") else AHEAD
+                for index in range(reading.at, min(reading.at + ahead, len(reading.pieces))):
+                    take = reading.takes.setdefault(index, Take())
+                    if not take.started:
+                        take.started = True
+                        return reading, index, take
+        return None
+
+    def _make_speech(self) -> None:
+        while True:
+            job = self._next_to_make()
+            if job is None:
+                self._rest_qwen()
+                self._make_more.wait(0.1)
+                self._make_more.clear()
+                continue
+            reading, index, take = job
+            text, voice, speed = reading.pieces[index], reading.engine_voice, reading.speed
+            try:
+                for audio in self._generate(text, voice, speed):
+                    take.chunks.append(audio)
+                    if reading.gone:
+                        break
+                self.last_error = ""
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()[:200].decode(errors="ignore")
+                self.last_error = f"{voice.split(':')[0]} speech failed: HTTP {exc.code} {detail}"
+                log.error(self.last_error)
+                self._fallback(reading, take, text, voice, speed)
+            except Exception as exc:  # noqa: BLE001 - keep the thread alive
+                self.last_error = f"{voice.split(':')[0]} speech failed: {exc}"
+                log.exception("synthesis failed for chunk: %r", text[:80])
+                self._fallback(reading, take, text, voice, speed)
+            finally:
+                take.done = True
+
+    def _next_audio(self, take: Take, at: int) -> np.ndarray | None:
+        """The take's next chunk, once there is one. None: it has ended, or playback was stopped."""
+        while not self._stop_playback.is_set():
+            if at < len(take.chunks):
+                return take.chunks[at]
+            if take.done:
+                return None
+            time.sleep(0.005)
+        return None
+
+    # -- playing it ------------------------------------------------------------
     def _run(self) -> None:
         was_idle = True
         while True:
@@ -409,25 +536,24 @@ class Speaker:
                 self._stream = None
                 self._played(reading, index, False)  # move on rather than retry this forever
                 continue
+            with self._lock:
+                take = reading.takes.setdefault(index, Take())
+            self._make_more.set()
             interrupted = False
             try:
                 # A moment for headphones to wake: speech starts on its first sound now.
                 if lead_in:
                     self._play(pacing.silence(LEAD_IN))
-                for audio in self._generate(chunk, voice, speed):
+                at = 0
+                while (audio := self._next_audio(take, at)) is not None:
+                    at += 1
                     if self._play(audio):
                         interrupted = True
                         break
-                self.last_error = ""
-            except urllib.error.HTTPError as exc:
-                detail = exc.read()[:200].decode(errors="ignore")
-                self.last_error = f"{voice.split(':')[0]} speech failed: HTTP {exc.code} {detail}"
-                log.error(self.last_error)
-                self._fallback(chunk, voice, speed)
             except Exception as exc:  # noqa: BLE001 - keep the worker alive
-                self.last_error = f"{voice.split(':')[0]} speech failed: {exc}"
-                log.exception("synthesis failed for chunk: %r", chunk[:80])
-                self._fallback(chunk, voice, speed)
+                self.last_error = f"could not play the speech: {exc}"
+                log.exception("playback failed")
+                self._stream = None
             stopped = interrupted or self._stop_playback.is_set()
             self._played(reading, index, stopped)
             # Wait as a reader would: longer after a paragraph than after a sentence.
@@ -438,18 +564,19 @@ class Speaker:
                     log.exception("speaker unavailable")
                     self._stream = None
 
-    def _fallback(self, chunk: str, engine_voice: str, speed: float) -> None:
-        """A cloud engine failed: say why with Kokoro, then read the text with Kokoro."""
+    def _fallback(self, reading: Reading, take: Take, chunk: str, engine_voice: str, speed: float) -> None:
+        """Another voice failed: say why with Kokoro, once, then read the text with Kokoro."""
         engine = engine_voice.split(":")[0]
         if engine == "kokoro":
             return
-        reason = "it needs an API key" if "environment variable" in self.last_error else "the request failed"
-        notice = f"The {engine} voice is not available, {reason}. Using Kokoro instead."
+        reason = "it needs an API key" if "environment variable" in self.last_error else "it could not start"
+        name = "Qwen" if engine == "qwen" else engine
+        notice = f"The {name} voice is not available, {reason}. Using Kokoro instead."
         try:
-            for text in (notice, chunk):
+            for text in ([chunk] if reading.warned else [notice, chunk]):
                 for audio in self._generate(text, f"kokoro:{self.cfg['voice']}", speed):
-                    if self._play(audio):
-                        return
+                    take.chunks.append(audio)
+            reading.warned = True
         except Exception:  # noqa: BLE001
             log.exception("kokoro fallback failed")
 

@@ -34,6 +34,8 @@ _EMOJI = re.compile(
 )
 # Curly apostrophes: Kokoro reads the one in "dogs’ bowl" as a closing quote.
 _QUOTE_MARK = re.compile("[‘’]")
+# Arrows, shapes and keyboard signs left over once the ones with a spoken name are replaced.
+_SIGN = re.compile("[\u2190-\u21ff\u2300-\u23ff\u25a0-\u25ff]")
 _MULTI_SPACE = re.compile(r"[ \t]+")
 _SPACE_BEFORE_PUNCT = re.compile(r"[ \t]+([.,!?;:])")
 _MULTI_NEWLINE = re.compile(r"\n{3,}")
@@ -60,8 +62,41 @@ def _clock(match: re.Match) -> str:
     return f"{left} oh {int(right)}" if right[0] == "0" else f"{left} {right}"
 
 
-# Short spoken replacements for symbols Kokoro would otherwise skip or mangle.
+def _version(match: re.Match) -> str:
+    """0.5.1 is "0 point 5 point 1"; Kokoro reads it digit by digit, and loses 0.5.0 entirely."""
+    return " point ".join(match.group(0).split("."))
+
+
+def _commit(match: re.Match) -> str:
+    return " ".join(match.group(0)[:7].upper())
+
+
+_FILE_TYPES = "py|ts|tsx|js|jsx|rs|go|rb|md|json|toml|yaml|yml|sh|c|cpp|h|swift|txt|pdf|html|css|csv|wav|mp3|png|jpg|log|lock"
+
+
+def _file_name(match: re.Match) -> str:
+    """pacing.py is "pacing dot P Y". Left as written, voices guess at it, and Qwen3-TTS can lose the sentence."""
+    return f"{match.group(1).replace('_', ' ')} dot {' '.join(match.group(2).upper())}"
+
+
+# Short spoken replacements for symbols the voices would otherwise skip or mangle.
 _SYMBOLS = [
+    (re.compile(r"\b([Vv]ersion )v(?=\d)"), r"\1"),
+    (re.compile(r"(?<![\w.])v(?=\d+\.\d+\.\d+\b)"), "version "),
+    (re.compile(r"(?<![\d.])\d+\.\d+\.\d+\b(?!\.\d)"), _version),
+    (re.compile(rf"\b([\w\-]+)\.({_FILE_TYPES})\b", re.IGNORECASE), _file_name),
+    (re.compile(r"\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b"), _commit),
+    (re.compile(r"\bCtrl\s*\+\s*"), "control "),
+    (re.compile(r"\bCmd\s*\+\s*"), "command "),
+    (re.compile(r"\bAlt\s*\+\s*"), "alt "),
+    (re.compile(r"\bShift\s*\+\s*"), "shift "),
+    (re.compile("\u2318\\s*"), "command "),
+    (re.compile("\u2303\\s*"), "control "),
+    (re.compile("\u2325\\s*"), "option "),
+    (re.compile("\u21e7\\s*"), "shift "),
+    (re.compile("\\s*\u2192\\s*"), " to "),
+    (re.compile(r"#L(?=\d)"), " line "),
+    (re.compile(r"#(?=\d)"), " number "),
     (re.compile(r"\b(and)/(or)\b", re.IGNORECASE), r"\1 \2"),
     (re.compile(r"(?<=\w)\(s\)"), "s"),
     (re.compile(r"(?<![\d:.])(\d+):(\d+)(?![\d:])"), _clock),
@@ -95,7 +130,7 @@ _SYMBOLS = [
     (re.compile(r"\s*\|\|\s*"), " or "),
     (re.compile(r"(?<=\w)/(?=\w)"), " slash "),
     (re.compile(r"\s*%\s*"), " percent "),
-    (re.compile(r"\s+@\s*"), " at "),
+    (re.compile(r"(?<![\w.])@\s*"), "at "),
     (re.compile(r"\s*\+\s*(?=\d)"), " plus "),
     (re.compile(r"(?<=\d)x(?=\d)"), " by "),
 ]
@@ -143,6 +178,15 @@ def _roman(numeral: str) -> int:
     return total
 
 
+_NUMBER_WORDS = ("One Two Three Four Five Six Seven Eight Nine Ten Eleven Twelve Thirteen Fourteen "
+                 "Fifteen Sixteen Seventeen Eighteen Nineteen Twenty").split()
+
+
+def _said(number: str) -> str:
+    """A list or section number as a word: at the start of a line, voices can drop the digit."""
+    return _NUMBER_WORDS[int(number) - 1] if number.isdigit() and 1 <= int(number) <= 20 else number
+
+
 def _spoken_line(line: str) -> str:
     """A heading's or list item's number, kept and marked off from its title. Read straight on,
     "8 Reports and Analysis" sounds like a count of reports; a reader says "Eight", waits, goes on.
@@ -159,12 +203,12 @@ def _spoken_line(line: str) -> str:
 
     marked = False
     if m := _NUMBER_ITEM.match(text):
-        text = f"{m.group(1)}. {text[m.end():]}"
+        text = f"{_said(m.group(1))}. {text[m.end():]}"
     elif (m := _ROMAN_ITEM.match(text)) and titled(text[m.end():]):
-        text = f"{_roman(m.group(1))}. {text[m.end():]}"
+        text = f"{_said(str(_roman(m.group(1))))}. {text[m.end():]}"
         marked = True
     elif (m := _NUMBER_START.match(text)) and titled(text[m.end():]):
-        text = f"{m.group(1)}. {text[m.end():]}"
+        text = f"{_said(m.group(1))}. {text[m.end():]}"
         marked = True
     elif (m := _LETTER_ITEM.match(text)) and titled(text[m.end():]):
         text = f"{m.group(1)}: {text[m.end():]}"
@@ -175,6 +219,14 @@ def _spoken_line(line: str) -> str:
     if header or marked:
         return text.rstrip() + "\n"
     return text
+
+
+def _inline_code(match: re.Match) -> str:
+    """Names in code read as words: `reload-plugins` is "reload plugins", `--help` is "dash dash help"."""
+    code = match.group(1)
+    dashes = re.match(r"-+", code)
+    code = "dash " * len(dashes.group(0)) + code[dashes.end():] if dashes else code
+    return re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])|(?<=\w)_(?=\w)", " ", code)
 
 
 def _replace_code_fence(match: re.Match) -> str:
@@ -211,10 +263,11 @@ def markdown_to_speech(text: str, *, max_chars: int | None = None) -> str:
     out = _end_lines(out)
     out = _FILE_LINE.sub(lambda m: f"{m.group(1)} line {m.group(2)}", out)
     out = _PATH.sub(lambda m: m.group(0).rsplit("/", 1)[-1], out)
-    out = _INLINE_CODE.sub(r"\1", out)
+    out = _INLINE_CODE.sub(_inline_code, out)
     out = _EMOJI.sub("", out)
     for pattern, repl in _SYMBOLS:
         out = pattern.sub(repl, out)
+    out = _SIGN.sub("", out)
     out = _MULTI_SPACE.sub(" ", out)
     out = _SPACE_BEFORE_PUNCT.sub(r"\1", out)
     out = _MULTI_NEWLINE.sub("\n\n", out)
