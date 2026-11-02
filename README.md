@@ -97,6 +97,13 @@ Markdown, plain text and PDF work. Headings, lists and tables are read as senten
 are announced rather than spelled out, and a PDF's page numbers, running headers and footers are
 skipped. A scanned PDF (pictures of pages) has no text to read.
 
+The voice reads the way a person does. It stops at colons, semicolons, dashes and parentheses,
+waits longer at the end of a sentence and longer again after a paragraph. A section number is set
+apart from its title ("8", a pause, "Reports and Analysis"), while a number in a sentence ("we have
+8 reports") is read straight on. Chapter VIII reads as "chapter eight", Fig. 3 as "figure three",
+and 10:30 as "ten thirty". The pauses are exact with the Kokoro voices; cloud voices choose their
+own, from the same cleaned-up text.
+
 ## Several chats at once
 
 Each chat runs on its own. Ending a call in one chat, pressing **Stop**, or a new reply never
@@ -260,7 +267,9 @@ Claude Code (any surface)
   joined back into paragraphs, broken words mended, headers and page numbers dropped), and the
   server reads it sentence by sentence, keeping its place for Pause and Resume; `clean.py` turns
   markdown into speakable text (code fences become "python code block, 12 lines", paths collapse
-  to file names, `app.py:42` reads as "app.py line 42").
+  to file names, `app.py:42` reads as "app.py line 42"). `pacing.py` adds the pauses: Kokoro
+  leaves almost none at punctuation, but says when each word falls, so a sentence is synthesized
+  whole, keeping its melody, and quiet is added at each mark.
 - Chats stay apart in three places. A window showing a chat attaches to it, so a chat with no
   surface (`$.session.surfaces()`, `session.attach` and `session.detach`) is one you're not in.
   Each chat's listener talks to it through its own folder, `~/.claudevoice/chats/<id>/`. And every

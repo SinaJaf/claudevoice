@@ -139,7 +139,7 @@ def _load_pdf(path: str, title: str, start: int | None, end: int | None) -> Docu
     last = min(count, end or count)
     # Running headers and footers are found across every page, then the range is taken.
     pages = _drop_running_lines(pages)[first - 1 : last]
-    text = "\n".join(reflow([line for page in pages for line in page]))
+    text = "\n\n".join(reflow([line for page in pages for line in page]))
     if not text.strip():
         raise DocumentError(f"{title} has no text to read; it may be scanned pages")
     return Document(title, markdown_to_speech(text), count)
@@ -247,7 +247,7 @@ def split_long(sentences: list[str], limit: int = 400) -> list[str]:
         while len(s) > limit:
             cut = next((i + 1 for sep in _BREAKS if (i := s.rfind(sep, limit // 2, limit)) > 0), limit)
             out.append(s[:cut].strip())
-            s = s[cut:].strip()
+            s = s[cut:].lstrip()
         if s:
             out.append(s)
     return out

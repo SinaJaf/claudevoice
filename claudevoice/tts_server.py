@@ -48,7 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import config, devices
+from . import config, devices, pacing
 from .clean import markdown_to_speech, split_sentences
 from .document import DocumentError, group, load, prepare_text, split_long
 
@@ -62,6 +62,7 @@ log = logging.getLogger("claudevoice.server")
 ROOT = str(Path(__file__).resolve().parent.parent)
 
 CLOUD_PIECE = 1200  # characters per request when a cloud voice reads a document
+LEAD_IN = 0.2  # seconds of quiet before speech that starts from silence
 
 
 class Reading:
@@ -289,10 +290,14 @@ class Speaker:
         elif engine == "elevenlabs":
             yield self._cloud_elevenlabs(text, voice)
         else:
-            for _, _, audio in self.pipeline(text, voice=voice, speed=speed):
-                if audio is None:
+            gap = 0.0
+            for result in self.pipeline(text, voice=voice, speed=speed):
+                if result.audio is None:
                     continue
-                yield audio.detach().cpu().numpy().astype(np.float32)
+                if gap:
+                    yield pacing.silence(gap)
+                yield pacing.pace(result.audio.detach().cpu().numpy().astype(np.float32), result.tokens, speed)
+                gap = pacing.pause_after(result.graphemes, speed)
 
     def _key(self, env_name: str) -> str:
         key = os.environ.get(env_name, "") or _login_shell_var(env_name)
@@ -394,6 +399,7 @@ class Speaker:
                 continue
             index, chunk = reading.at, reading.pieces[reading.at]
             voice, speed = reading.engine_voice, reading.speed
+            lead_in = was_idle
             try:
                 self._ensure_stream(new_reply=was_idle)
                 was_idle = False
@@ -405,6 +411,9 @@ class Speaker:
                 continue
             interrupted = False
             try:
+                # A moment for headphones to wake: speech starts on its first sound now.
+                if lead_in:
+                    self._play(pacing.silence(LEAD_IN))
                 for audio in self._generate(chunk, voice, speed):
                     if self._play(audio):
                         interrupted = True
@@ -421,10 +430,10 @@ class Speaker:
                 self._fallback(chunk, voice, speed)
             stopped = interrupted or self._stop_playback.is_set()
             self._played(reading, index, stopped)
-            # Tiny pause between sentences reads more naturally than butting them together.
+            # Wait as a reader would: longer after a paragraph than after a sentence.
             if not stopped:
                 try:
-                    self._write(np.zeros(int(SAMPLE_RATE * 0.12), dtype=np.float32))
+                    self._play(pacing.silence(pacing.pause_after(chunk, speed)))
                 except Exception:  # noqa: BLE001
                     log.exception("speaker unavailable")
                     self._stream = None
