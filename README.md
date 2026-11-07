@@ -1,5 +1,7 @@
 # claudevoice
 
+[![tests](https://github.com/SinaJaf/claudevoice/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/SinaJaf/claudevoice/actions/workflows/tests.yml)
+
 **Talk with Claude Code, and hear it talk back.** A live, hands-free voice conversation right inside
 your Claude Code chat: you speak, Claude answers out loud when you've finished, and you can cut in
 any time. It reads your files aloud too. It all runs on your computer.
@@ -238,11 +240,18 @@ works the same. Every package installs from a ready-made build; nothing is compi
 
 | system | chips | needs | status |
 |--------|-------|-------|--------|
-| macOS 14 Sonoma or newer | Apple Silicon (M1 and later) | uv | tested |
-| macOS 13 or newer | Intel | uv | builds resolve (PyTorch 2.2, the last for Intel Macs); not yet tested on hardware |
-| Windows 10 / 11 | Intel or AMD (x64) | uv | builds resolve; not yet tested on hardware |
-| Windows 11 | ARM (Snapdragon) | uv | builds resolve; not yet tested on hardware |
-| Linux, glibc 2.28+ (Ubuntu 20.04+, Debian 10+, Fedora, Arch) | Intel or AMD (x64), ARM64 | uv, PortAudio | builds resolve (CPU-only PyTorch, ~200 MB instead of ~2.5 GB); not yet tested on hardware |
+| macOS 14 Sonoma or newer | Apple Silicon (M1 and later) | uv | used daily; passes every test on GitHub |
+| macOS 13 or newer | Intel | uv | passes every test on GitHub (macOS 15); PyTorch 2.2, the last for Intel Macs |
+| Windows 10 / 11 | Intel or AMD (x64) | uv | used on a laptop, Qwen3-TTS on NVIDIA too; passes every test on GitHub |
+| Windows 11 | ARM (Snapdragon) | uv | passes every test on GitHub |
+| Linux, glibc 2.28+ (Ubuntu 20.04+, Debian 10+, Fedora, Arch) | Intel or AMD (x64) | uv, PortAudio | passes every test on GitHub (Ubuntu 24.04); CPU-only PyTorch, ~200 MB instead of ~2.5 GB |
+| Linux, as above | ARM64 | uv, PortAudio | passes every test on GitHub (Ubuntu 24.04) |
+
+"Passes every test on GitHub" means a clean install, all the tests, and Kokoro speaking a sentence
+that Parakeet hears back word for word, on every push
+([latest results](https://github.com/SinaJaf/claudevoice/actions/workflows/tests.yml)). The test
+machines have no speakers or microphone, so sound devices are the one part they can't check: if
+yours aren't found, **Copy setup report** in the settings shows what the plugin sees.
 
 Memory: about 1.5 GB during a call, up to about 2.5 GB while writing down an hour-long turn.
 Speed on an Apple M-series laptop: a minute of speech is written down in about a second.
@@ -311,13 +320,31 @@ Claude Code (any surface)
 ```bash
 claude plugin validate .      # manifest + hooks module
 claude plugin test .          # tests/panel.test.tsx against the engine
-.venv/bin/python -m unittest tests.test_speaker   # the voice server's speech, with no sound
+.venv/bin/python -m unittest tests.test_report tests.test_qwen tests.test_reading tests.test_speaker
+.venv/bin/python -m claudevoice self-test         # Kokoro speaks, Parakeet must hear the same words
 ```
+
+Every push runs the same on GitHub ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)):
+a clean install, the tests and the self-test on macOS (Apple Silicon and Intel), Windows (x64 and
+Arm) and Linux (x64 and Arm).
 
 Edits reach a running session with `/reload-plugins` when the plugin was installed from this folder
 (`claude plugin marketplace add <folder>` then `claude plugin install claudevoice@claudevoice`).
 
 ## Troubleshooting
+
+Something not working? Two things help most:
+
+- **Copy setup report**, at the bottom of the ⚙ voice settings, puts a short report on your
+  clipboard: your system, what is installed, which voice files are downloaded, the sound devices
+  it sees and the last errors in the logs. It holds no text that was read aloud, no transcripts
+  and no file names. Paste it into a [bug report](https://github.com/SinaJaf/claudevoice/issues/new/choose).
+  If the plugin won't start at all, run `uv run python -m claudevoice report` from the plugin's folder.
+- **The self-test**, `uv run python -m claudevoice self-test` from the plugin's folder, has Kokoro
+  speak a sentence and Parakeet write down what it hears. It needs no speakers or microphone, so it
+  separates "the voice is broken" from "the sound devices are".
+
+Other things to check:
 
 - Logs: `~/.claudevoice/server.log` (speech) and `~/.claudevoice/claudevoice.log` (hooks).
 - **Read aloud** read something other than you meant: it reads anything copied since you last

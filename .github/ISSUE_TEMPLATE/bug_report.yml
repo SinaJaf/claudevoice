@@ -1,0 +1,29 @@
+name: Something doesn't work
+description: Report a problem with claudevoice
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting it. The setup report below tells us your system, what is installed and what the logs say, which is usually enough to find the cause.
+
+        **To get it:** in Claude Code, open the ⚙ voice settings and press **Copy setup report**, then paste it here. It holds no text that was read aloud, no transcripts and no file names. If the plugin won't start, run this in a terminal instead, from the plugin's folder: `uv run python -m claudevoice report`
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, and what went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+  - type: textarea
+    id: report
+    attributes:
+      label: Setup report
+      description: Paste the report from Copy setup report.
+      render: markdown
+    validations:
+      required: true

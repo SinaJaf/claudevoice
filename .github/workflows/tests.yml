@@ -1,0 +1,59 @@
+# Installs claudevoice the way the plugin does on each system, then proves the voice works:
+# the server, reading and engine tests, and Kokoro speaking a sentence that Parakeet hears
+# back. No sound hardware is needed.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  voice:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS Apple Silicon, os: macos-15 }
+          - { name: macOS Intel, os: macos-15-intel }
+          - { name: Windows x64, os: windows-latest }
+          - { name: Linux x64, os: ubuntu-24.04 }
+          - { name: Linux Arm, os: ubuntu-24.04-arm }
+          - { name: Windows Arm, os: windows-11-arm }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Sound library (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+      - name: Install, as the plugin does
+        run: uv sync --locked
+      - name: Server, reading and engine tests
+        run: uv run --locked python -m unittest tests.test_report tests.test_qwen tests.test_reading tests.test_speaker
+      - name: Voice files from the last run
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface
+          key: voices-${{ runner.os }}-${{ runner.arch }}-v1
+      - name: Speak a sentence and hear it back
+        run: uv run --locked python -m claudevoice self-test
+      - name: Setup report
+        if: always()
+        run: uv run --locked python -m claudevoice report
+
+  plugin:
+    name: Plugin checks and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Validate
+        run: claude plugin validate .
+      - name: Plugin tests
+        run: claude plugin test .
