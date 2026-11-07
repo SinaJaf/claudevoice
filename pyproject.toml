@@ -1,6 +1,6 @@
 [project]
 name = "claudevoice"
-version = "0.8.0"
+version = "0.8.1"
 description = "Voice for Claude Code: Kokoro speech, local or cloud listening"
 readme = "README.md"
 license = "MIT"

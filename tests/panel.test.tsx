@@ -43,18 +43,19 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   const written: string[] = []
   const writes: { path: string; content: string }[] = []
   const opened: string[] = []
+  const shown = new Set<string>()
   on('command.register', () => ({ value: { command: 'voice-panel' } }))
   on('ui.open', (_, e) => {
     opened.push(e.id)
+    shown.add(e.id)
     return { value: { isPlaced: true } }
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('session.messages', () => ({
-    value: [
-      { role: 'user', text: 'say hi', toolUses: [] },
-      { role: 'assistant', text: 'Hello **there**, friend.', toolUses: [] },
-    ],
-  }))
+  const messages = [
+    { role: 'user' as const, text: 'say hi', toolUses: [] },
+    { role: 'assistant' as const, text: 'Hello **there**, friend.', toolUses: [] },
+  ]
+  on('session.messages', () => ({ value: [...messages] }))
   on('http.fetch', (_, e) => {
     const body = e.init?.body ?? ''
     fetches.push({ url: e.url, body })
@@ -159,7 +160,11 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
           : JSON.stringify({ ok: true })
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
-  on('ui.close', () => ({ value: undefined }))
+  on('ui.close', (_, e) => {
+    shown.delete(e.id)
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({ value: [...shown].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })) }))
   on('session.id', () => ({ value: 'chat-1' }))
   const box = { text: '' }
   on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } }))
@@ -195,10 +200,11 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
   on('session.cwd', () => ({ value: '/proj' }))
   const selection = { text: '' }
   on('ui.selection', () => ({ value: selection.text === '' ? undefined : { text: selection.text } }))
+  const contents = new Map<string, string>()
   on('fs.read', (_, e) => ({
     value: e.path.endsWith('/.claude-plugin/plugin.json')
       ? JSON.stringify({ version: '0.4.4' })
-      : e.path.endsWith('/mic.owner') ? mic.owner : (results.get(e.path) ?? ''),
+      : e.path.endsWith('/mic.owner') ? mic.owner : (contents.get(e.path) ?? results.get(e.path) ?? ''),
   }))
   // The desktop app names the claude it runs: its folder, with the command in MacOS/.
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/tester' : e.name === 'CLAUDE_CODE_EXECPATH' ? '/apps/claude.app/Contents/' : undefined }))
@@ -209,7 +215,7 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics, toasts, presence, mic, server }
+  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics, toasts, presence, mic, server, messages, contents }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -493,9 +499,10 @@ test('Read aloud reads your selection, else a file named in the prompt box, else
   mock.store(on)
   await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
 
+  w.messages.splice(1, 0, { role: 'assistant', text: 'First this. **The second section**, as selected. Then more.', toolUses: [] })
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
-    // Text selected in a file you opened: that is what is read.
+    // Text selected in the chat: that is what is read.
     w.selection.text = 'The second section, as selected.'
     await ui.press({ key: 'read' })
     expect(readBody(w)).toEqual({ text: 'The second section, as selected.', title: 'selection' })
@@ -691,6 +698,8 @@ test('On a Mac, text highlighted in the Files pane is read, and copying the same
 
   // Highlighted in a file open in the app (the app itself tells plugins only about the chat).
   w.mac.highlighted = 'A section of the README, highlighted in the Files pane.'
+  w.mac.openFile = ['README.md']
+  w.contents.set('/proj/README.md', '# Title\n\nA section of the [README](https://example.com), highlighted in the Files pane.\n')
   await ui.press({ key: 'read' })
   expect(w.mac.asked.pop()).toContain('app')
   expect(readBody(w)).toEqual({ text: 'A section of the README, highlighted in the Files pane.', title: 'selection' })
@@ -699,6 +708,7 @@ test('On a Mac, text highlighted in the Files pane is read, and copying the same
   expect(w.writes.filter(x => x.path.endsWith('last-read.json')).pop()?.content).not.toContain('README')
   await ui.press({ key: 'stop' })
   w.mac.highlighted = ''
+  w.mac.openFile = []
 
   // Copied: read. Copied again, the very same text: read again (the copy counter moved).
   w.clip.text = 'Copied from a PDF in Preview.'
@@ -764,6 +774,7 @@ test('On a Mac, with nothing highlighted, Read aloud reads the whole file open i
 
   // A highlight in that file still wins: just that part is read.
   w.mac.openFile = ['README.md']
+  w.contents.set('/proj/README.md', 'An introduction.\n\nOnly this paragraph.\n')
   w.mac.highlighted = 'Only this paragraph.'
   await ui.press({ key: 'read' })
   expect(readBody(w)).toEqual({ text: 'Only this paragraph.', title: 'selection' })
@@ -1278,4 +1289,90 @@ test('With an NVIDIA card there is one Qwen3-TTS engine to choose', async ($, on
   expect(options.some(o => o.value === 'qwen:Aiden')).toBe(true)
   expect(options.some(o => o.value.startsWith('qwen_light:'))).toBe(false)
   await pane.unmount()
+})
+
+test('With settings open, a reading that ends still clears from the footer', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading | null } = { speaking: false }
+  const w = world(on, state)
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const bar = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  w.box.text = 'Read @notes.md'
+  await bar.press({ key: 'read' })
+  await clock.advance(400)
+  expect(await bar.find({ type: 'Button', text: /Pause/ })).toBeDefined()
+  await bar.press({ key: 'settings' })
+  await clock.advance(10)
+  state.speaking = false
+  state.reading = null
+  await clock.advance(700)
+  expect(await bar.find({ type: 'Button', text: /Pause/ })).toBeUndefined()
+  expect(await bar.find({ type: 'Button', text: /Read aloud/ })).toBeDefined()
+  await bar.unmount()
+})
+
+test('A highlight left in another chat is not read here; this chat\u2019s reply is', async ($, on) => {
+  const state: { speaking: boolean; reading?: Reading } = { speaking: false }
+  const w = world(on, state, { mac: true })
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/proj', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const speaks = () => w.fetches.filter(f => f.url.endsWith('/speak')).length
+  const reads = () => w.fetches.filter(f => f.url.endsWith('/read')).length
+
+  // The app hands over a selection made in the chat you came from.
+  w.selection.text = 'Words someone highlighted in another chat, earlier today.'
+  let before = [speaks(), reads()]
+  await ui.press({ key: 'read' })
+  expect([speaks(), reads()]).toEqual([before[0]! + 1, before[1]])
+  expect(w.fetches.filter(f => f.url.endsWith('/speak')).pop()?.body).toContain('Hello **there**, friend.')
+  expect(w.writes.filter(x => x.path.endsWith('last-read.json')).pop()?.content).toContain('"source":"last reply"')
+  await ui.press({ key: 'stop' })
+  await clock.advance(400)
+
+  // The same for a highlight the Mac sees in another chat's view.
+  w.selection.text = ''
+  w.mac.highlighted = 'Another chat still shows this highlighted passage on its page.'
+  before = [speaks(), reads()]
+  await ui.press({ key: 'read' })
+  expect([speaks(), reads()]).toEqual([before[0]! + 1, before[1]])
+  await ui.press({ key: 'stop' })
+  await ui.unmount()
+
+  // On the terminal there is no other chat: a selection in a file you opened is read.
+  const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  w.mac.highlighted = ''
+  w.selection.text = 'A paragraph from a file opened in the terminal.'
+  await term.press({ key: 'read' })
+  expect(readBody(w)).toEqual({ text: 'A paragraph from a file opened in the terminal.', title: 'selection' })
+  await term.unmount()
+})
+
+test('A scroll that cannot move the settings pane draws nothing, so an open dropdown keeps its place', async ($, on) => {
+  world(on, { speaking: false })
+  let moves = 0
+  on('ui.scroll', () => (moves++, {})) // beneath the plugin: the engine moving the window and drawing
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const bar = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await bar.press({ key: 'settings' })
+  await clock.advance(10)
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  const wheel = (offset: number, contentRows: number) => $.ui.scroll({
+    component: 'Pane', requestId: 'claudevoice-settings', offset, by: 1, bodyRows: 30, contentRows, origin: { kind: 'person' },
+  })
+  // The settings fit: a wheel over an open dropdown moves nothing and is let go.
+  expect((await wheel(0, 20)).deny).toBeDefined()
+  expect(moves).toBe(0)
+  // A pane taller than its window still scrolls, once per row; the same row again is let go.
+  expect((await wheel(3, 60)).deny).toBeUndefined()
+  expect(moves).toBe(1)
+  expect((await wheel(3, 60)).deny).toBeDefined()
+  expect(moves).toBe(1)
+  expect(await pane.find({ type: 'Select', key: 'speaking' })).toBeDefined()
+  await pane.unmount()
+  await bar.unmount()
 })

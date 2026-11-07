@@ -464,6 +464,9 @@ async function setPhase($: Engine, p: VoicePhase): Promise<void> {
 
 let ticking = false
 
+const sameReading = (a: ReadingState, b: ReadingState): boolean =>
+  a.title === b.title && a.at === b.at && a.of === b.of && a.paused === b.paused
+
 /** Advance the footer's animation while something is happening; stops when idle. */
 function startTicker($: Engine): void {
   if (ticking) return
@@ -500,12 +503,12 @@ async function readAloud($: Engine, inApp = true): Promise<void> {
     return
   }
   const selected = await $.ui.selection().catch(() => undefined)
-  if (selected !== undefined && selected.text.trim() !== '') {
+  if (selected !== undefined && selected.text.trim() !== '' && (!inApp || (await highlightHere($, selected.text, seen)))) {
     await noteRead($, 'chat selection', selected.text.length, seen)
     await readDocument($, { text: selected.text, title: 'selection' })
     return
   }
-  if (seen.highlighted.trim() !== '') {
+  if (seen.highlighted.trim() !== '' && (await highlightHere($, seen.highlighted, seen))) {
     await noteRead($, 'highlighted in the app', seen.highlighted.length, seen)
     await readDocument($, { text: seen.highlighted, title: 'selection' })
     return
@@ -525,6 +528,33 @@ async function readAloud($: Engine, inApp = true): Promise<void> {
   }
   await noteRead($, 'last reply', 0, seen)
   await readLastReply($)
+}
+
+/** Text as a comparison sees it: letters and digits only, link targets and tags gone, so what
+ *  the app shows (rendered) matches what the conversation holds (markdown). */
+const squash = (text: string): string =>
+  text.toLowerCase().replace(/\]\([^)]*\)/g, ' ').replace(/<[^>]+>/g, ' ').replace(/[^\p{L}\p{N}]+/gu, '')
+
+/** `text` lies in `within`: its start, middle or end is found there (a link or a table in one
+ *  of them changes how it reads). Too short to tell apart: yes. */
+function liesIn(text: string, within: string): boolean {
+  const t = squash(text)
+  if (t.length < 16) return true
+  const hay = squash(within)
+  const mid = Math.floor(t.length / 2)
+  return [t.slice(0, 48), t.slice(Math.max(0, mid - 24), mid + 24), t.slice(-48)].some(part => hay.includes(part))
+}
+
+/** A highlight belongs to this chat: it is in this chat's conversation, or in the file its
+ *  Files pane has open. The desktop app keeps a highlight made in another chat and hands it
+ *  over here too, so without this Read aloud would read the chat you just left. */
+async function highlightHere($: Engine, text: string, seen: Seen): Promise<boolean> {
+  const messages = await $.session.messages()
+  if (liesIn(text, messages.map(m => m.text).join('\n'))) return true
+  const open = seen.openFile.length > 0 ? await openFileOnDisk($, seen.openFile) : null
+  if (open === null) return false
+  if (/\.pdf$/i.test(open.path)) return true // a PDF's text is not there to compare
+  return liesIn(text, await $.fs.read(open.path).catch(() => ''))
 }
 
 async function readLastReply($: Engine): Promise<void> {
@@ -740,11 +770,14 @@ function watchPlayback($: Engine): void {
     void (async () => {
       if ((await read($, phase)) !== 'speaking') return // a new turn began
       const h = await health($)
-      await update($, reading, () => h?.reading ?? NOT_READING)
+      const now = h?.reading ?? NOT_READING
       if (h?.speaking) {
+        // Written when it moves: an unchanged write still draws the footer again.
+        if (!sameReading(await read($, reading), now)) await update($, reading, () => now)
         watchPlayback($)
         return
       }
+      await update($, reading, () => now)
       if (voiceLeftBehind) return // you left mid-sentence; cameBack carries on from there
       if (h?.last_error) {
         await update($, note, () => h.last_error ?? '')
@@ -1192,7 +1225,11 @@ async function setSetting($: Engine, key: string, value: string): Promise<void> 
   if (ran.exitCode !== 0) $.ui.toast(`could not save ${key}: ${ran.stderr.trim()}`)
 }
 
+/** Where the settings pane's window is, in rows: a scroll that leaves it there moves nothing. */
+let settingsOffset = 0
+
 async function openSettings($: Engine): Promise<void> {
+  settingsOffset = 0
   await loadSettings($)
   await $.ui.open({ id: SETTINGS_PANE, title: 'Voice settings', focus: true, closeOnEscape: true, rows: 40 })
 }
@@ -1759,4 +1796,12 @@ export const register: Register = on => {
 
   // The gear's settings dialog.
   on('ui.render', { component: 'Pane', requestId: SETTINGS_PANE }, ($, e) => settingsPane($, e))
+  // A wheel turned over an open dropdown in settings reaches the pane behind it too, and a
+  // pane that scrolls is drawn again, which throws the dropdown's list back to where it was.
+  // So a scroll that cannot move the pane (it fits, or is already at that row) draws nothing.
+  on('ui.scroll', { component: 'Pane', requestId: SETTINGS_PANE }, ($, e, next) => {
+    if (e.contentRows <= e.bodyRows || e.offset === settingsOffset) return { deny: 'nothing to scroll' }
+    settingsOffset = e.offset
+    return next(e)
+  })
 }
