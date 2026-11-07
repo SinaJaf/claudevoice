@@ -1228,6 +1228,26 @@ async function setSetting($: Engine, key: string, value: string): Promise<void> 
 /** Where the settings pane's window is, in rows: a scroll that leaves it there moves nothing. */
 let settingsOffset = 0
 
+const ISSUES_URL = 'https://github.com/SinaJaf/claudevoice/issues'
+
+/** A setup report for a bug report, on the clipboard: what the Python side finds (no text that
+ *  was read, no file names), and the app's side. Saved to a file where the clipboard refuses. */
+async function copySetupReport($: Engine, surface: Surface['surface']): Promise<void> {
+  const ran = await $.process.run([...(await python($)), '-m', 'claudevoice', 'report'], { cwd: root($), timeoutMs: 60000 }).catch(() => null)
+  const homeDir = await home($)
+  const why = (ran?.stderr ?? 'it did not start').trim().split('\n').pop()?.split(homeDir).join('~') ?? ''
+  const claude = ((await $.env.get('CLAUDE_CODE_EXECPATH')) ?? '').match(/(\d+\.\d+\.\d+)/)?.[1] ?? 'unknown'
+  const text = `${ran?.exitCode === 0 ? ran.stdout.trim() : `### claudevoice setup report\n\n- The Python side could not run: ${why}`}\n- Claude Code ${claude}, ${surface}\n`
+  const copied = await $.ui.copy({ text, surface }).catch(() => ({ isCopied: false }))
+  if (copied.isCopied) {
+    $.ui.toast(`Setup report copied. Paste it into a bug report: ${ISSUES_URL}`)
+    return
+  }
+  const path = await flagPath($, 'setup-report.md')
+  await $.fs.write(path, text)
+  $.ui.toast(`Setup report saved to ${path.split(homeDir).join('~')}; attach it to a bug report: ${ISSUES_URL}`)
+}
+
 async function openSettings($: Engine): Promise<void> {
   settingsOffset = 0
   await loadSettings($)
@@ -1651,6 +1671,8 @@ async function settingsPane($: Engine, e: Surface) {
         <Text dimColor>Parakeet runs on this computer and downloads about 650 MB once. Cloud engines read OPENAI_API_KEY and ELEVENLABS_API_KEY from your environment. Set the ElevenLabs voice id with: claudevoice config tts_voice ID</Text>
       </Box>
       <Box marginTop={1}>
+        <Button key="report" label="Copy setup report" plain onPress={() => void copySetupReport($, e.surface)} />
+        <Text>  </Text>
         <Button key="close" label="Close" role="dismiss" onPress={() => void $.ui.close({ id: SETTINGS_PANE })} />
       </Box>
     </Box>

@@ -15,6 +15,8 @@ USAGE = """claudevoice <command>
   stop-server                    stop the voice server (it restarts on the next use)
   fetch-voice [light]            download the Qwen3-TTS voice, or its lighter engine's files (1 to 2 GB, once)
   qwen-check                     can this computer run Qwen3-TTS, and why not if not
+  self-test [--no-listen]        speak a sentence and check it is heard: proves the voice works here
+  report                         a setup report to paste into a bug report (nothing is sent anywhere)
   say "text" [--voice V]         speak text through the server (starts it if needed)
   stop                           cut off whatever is playing
   voices                         list the English Kokoro voices
@@ -50,6 +52,14 @@ def main(argv: list[str] | None = None) -> int:
         qwen.fetch(qwen.LIGHT if rest[:1] == ["light"] else qwen.STANDARD)
         print("voice ready")
         return 0
+    if cmd == "self-test":
+        from .selftest import main as selftest_main
+
+        return selftest_main(rest)
+    if cmd == "report":
+        from .report import main as report_main
+
+        return report_main(rest)
     if cmd == "qwen-check":
         from . import qwen
 

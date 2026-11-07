@@ -198,6 +198,11 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     return { value: { kind: 'file' as const, size: 100, mtimeMs: 0, isLink: false } }
   })
   on('session.cwd', () => ({ value: '/proj' }))
+  const copied: string[] = []
+  on('ui.copy', (_, e) => {
+    copied.push(e.text)
+    return { value: { isCopied: true } }
+  })
   const selection = { text: '' }
   on('ui.selection', () => ({ value: selection.text === '' ? undefined : { text: selection.text } }))
   const contents = new Map<string, string>()
@@ -215,7 +220,7 @@ function world(on: On, state: { speaking: boolean; reading?: Reading }, opts: { 
     writes.push({ path: e.path, content: e.text })
     return { value: undefined }
   })
-  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics, toasts, presence, mic, server, messages, contents }
+  return { fetches, runs, submitted, written, writes, opened, box, listener, selection, clip, mac, mics, toasts, presence, mic, server, messages, contents, copied }
 }
 
 test('Read aloud speaks the last reply through the Kokoro server', async ($, on) => {
@@ -1375,4 +1380,18 @@ test('A scroll that cannot move the settings pane draws nothing, so an open drop
   expect(await pane.find({ type: 'Select', key: 'speaking' })).toBeDefined()
   await pane.unmount()
   await bar.unmount()
+})
+
+test('Copy setup report puts the report and the app version on the clipboard', async ($, on) => {
+  const w = world(on, { speaking: false })
+  const clock = mock.clock(on)
+  mock.store(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const pane = await $.ui.mount({ ...SETTINGS, surface: 'desktop' })
+  await pane.press({ key: 'report' })
+  await clock.advance(10)
+  expect(w.runs.some(argv => argv.join(' ').endsWith('claudevoice report'))).toBe(true)
+  expect(w.copied.pop()).toContain('- Claude Code ')
+  expect(w.toasts.some(t => t.includes('github.com/SinaJaf/claudevoice/issues'))).toBe(true)
+  await pane.unmount()
 })

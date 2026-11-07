@@ -311,13 +311,31 @@ Claude Code (any surface)
 ```bash
 claude plugin validate .      # manifest + hooks module
 claude plugin test .          # tests/panel.test.tsx against the engine
-.venv/bin/python -m unittest tests.test_speaker   # the voice server's speech, with no sound
+.venv/bin/python -m unittest tests.test_report tests.test_qwen tests.test_reading tests.test_speaker
+.venv/bin/python -m claudevoice self-test         # Kokoro speaks, Parakeet must hear the same words
 ```
+
+Every push runs the same on GitHub ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)):
+a clean install, the tests and the self-test on macOS (Apple Silicon and Intel), Windows and Linux,
+with Linux and Windows on Arm tried as well.
 
 Edits reach a running session with `/reload-plugins` when the plugin was installed from this folder
 (`claude plugin marketplace add <folder>` then `claude plugin install claudevoice@claudevoice`).
 
 ## Troubleshooting
+
+Something not working? Two things help most:
+
+- **Copy setup report**, at the bottom of the ⚙ voice settings, puts a short report on your
+  clipboard: your system, what is installed, which voice files are downloaded, the sound devices
+  it sees and the last errors in the logs. It holds no text that was read aloud, no transcripts
+  and no file names. Paste it into a [bug report](https://github.com/SinaJaf/claudevoice/issues/new/choose).
+  If the plugin won't start at all, run `uv run python -m claudevoice report` from the plugin's folder.
+- **The self-test**, `uv run python -m claudevoice self-test` from the plugin's folder, has Kokoro
+  speak a sentence and Parakeet write down what it hears. It needs no speakers or microphone, so it
+  separates "the voice is broken" from "the sound devices are".
+
+Other things to check:
 
 - Logs: `~/.claudevoice/server.log` (speech) and `~/.claudevoice/claudevoice.log` (hooks).
 - **Read aloud** read something other than you meant: it reads anything copied since you last
