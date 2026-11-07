@@ -1,10 +1,25 @@
 {
   "name": "claudevoice",
   "version": "0.8.2",
-  "description": "Voice for Claude Code: read replies and files (markdown, text, PDF) aloud with Kokoro and hold spoken calls, with local or cloud speech engines",
-  "author": { "name": "SinaJaf" },
+  "description": "Talk with Claude Code and hear it answer: hands-free voice calls and files read aloud (markdown, text, PDF), with speech running on your own computer",
+  "author": {
+    "name": "SinaJaf"
+  },
   "homepage": "https://github.com/SinaJaf/claudevoice",
+  "repository": "https://github.com/SinaJaf/claudevoice",
   "license": "MIT",
-  "keywords": ["voice", "tts", "speech", "kokoro", "whisper"],
+  "keywords": [
+    "voice",
+    "speech",
+    "text-to-speech",
+    "speech-to-text",
+    "read-aloud",
+    "hands-free",
+    "accessibility",
+    "kokoro",
+    "parakeet",
+    "qwen3-tts",
+    "whisper"
+  ],
   "types": "./types/index.d.ts"
 }

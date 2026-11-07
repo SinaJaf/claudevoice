@@ -1,11 +1,16 @@
 {
   "name": "claudevoice",
-  "owner": { "name": "SinaJaf" },
+  "owner": {
+    "name": "SinaJaf"
+  },
+  "metadata": {
+    "description": "claudevoice: voice calls with Claude Code and files read aloud, running on your own computer"
+  },
   "plugins": [
     {
       "name": "claudevoice",
       "source": "./",
-      "description": "Voice for Claude Code: read replies aloud with Kokoro and hold spoken calls, with local or cloud speech engines"
+      "description": "Talk with Claude Code and hear it answer: hands-free voice calls and files read aloud, with speech running on your own computer"
     }
   ]
 }

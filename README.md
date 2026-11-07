@@ -17,11 +17,16 @@ any time. It reads your files aloud too. It all runs on your computer.
 - **Many chats, no crossed wires.** Each chat has its own call and its own voice, and speaks only
   while you're in it. Sounds tell you when another chat is done or needs you.
 - **Private and free.** Listening and speaking run on your computer, with no extra account or API key.
+  Exactly what it downloads, runs and sends is [listed below](#what-it-downloads-runs-and-sends).
+
+Works in the Claude Code desktop app and in the terminal, on macOS, Windows and Linux
+([tested on each](#where-it-runs)).
 
 ## Get started
 
 1. **Add the plugin.** In the Claude Code desktop app: **+** next to the prompt, **Plugins**,
-   **Add marketplace** `SinaJaf/claudevoice`, then **Add plugin**.
+   **Add marketplace** `SinaJaf/claudevoice`, then **Add plugin**. In a terminal session:
+   `/plugin install claudevoice --marketplace SinaJaf/claudevoice`
 2. **Press ● Call** under the prompt box and start talking. The first time, it sets itself up
    (it installs [uv](https://docs.astral.sh/uv/) if needed and downloads the voice): a few minutes,
    once, with pop-ups saying what it is doing. On Linux, install PortAudio first
@@ -133,6 +138,50 @@ Two settings in the **⚙** tell you what other chats are up to:
 - **Always notify me from this chat** (set per chat): that chat reads its results aloud and says
   when it needs you, wherever you are in the app. From elsewhere it starts with the chat's project
   name ("From KLIZ…"), and waits its turn behind the chat you're in.
+
+## What it downloads, runs and sends
+
+Nothing leaves your computer unless you pick a cloud engine. There's no account and no telemetry.
+
+**It downloads, once**, the first time you press **Call** or **Read aloud**:
+
+- [uv](https://docs.astral.sh/uv/), if it isn't installed, with Astral's installer from astral.sh.
+  uv may fetch a Python build of its own.
+- The Python packages, from PyPI (about 900 MB; on Linux, PyTorch comes from download.pytorch.org),
+  and spaCy's small English model from GitHub.
+- The models, from Hugging Face: Kokoro (about 330 MB), Parakeet (about 650 MB), Smart Turn and
+  Silero VAD (a few MB). Qwen3-TTS (2 to 2.5 GB) and Whisper only if you pick them.
+
+**It checks** this repository's `plugin.json` on GitHub every few hours, to tell you about a new
+version. Nothing is sent with that request.
+
+**It runs on your computer:**
+
+- A voice server that only answers on this computer (127.0.0.1, port 8765). It stays running so the
+  voice starts quickly; `claudevoice stop-server` stops it, and it starts again when next needed.
+- During a call, a listener that records your microphone, one turn at a time. Recordings stay in
+  memory and are never saved (the Mac's own recognizer gets them through a temporary folder that is
+  deleted straight after).
+- Small helpers, only when you press **Read aloud**: `osascript` on a Mac (the clipboard, and,
+  through Accessibility, what's highlighted in the Claude app and which file its Files pane has
+  open), PowerShell on Windows, `wl-paste`, `xclip` or `xsel` on Linux. And `afplay`, PowerShell or
+  `paplay` to play the notification sounds, if you turn them on.
+- `uv sync` to install the Python side, and `claude plugin` commands when you press **Update now**.
+
+**It sends:**
+
+- What you say in a call goes to Claude as your message, exactly as if you'd typed it. During a
+  call, Claude also gets a short note asking it to answer in a spoken style.
+- Only if you pick them: the cloud voices send the text being read to OpenAI or ElevenLabs, and
+  OpenAI's cloud transcription sends your recorded speech to OpenAI. The Mac's own recognizer stays
+  on the device when the Mac supports that, and Windows' recognizer uses Microsoft's online speech
+  service. Their own privacy policies apply.
+
+**It keeps**, in `~/.claudevoice/`: your settings; logs, which name the files read aloud but hold
+none of the text; and what you said in each turn, in a small hand-off file that the next call
+clears out once it's a day old.
+`last-read.json` records where the last **Read aloud** found its text and how long it was, never
+the text itself. The packages live in the plugin's folder and the models in the Hugging Face cache.
 
 ---
 
